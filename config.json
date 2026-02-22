@@ -3,6 +3,7 @@
   "iterations": 10,
   "timeout": 5.0,
   "dns_server": "8.8.8.8",
+  "http_check": true,
   "domains": [
     "www.google.com",
     "www.github.com",

@@ -6,7 +6,7 @@ interval. Each target gets its own CSV file. All targets are polled
 concurrently so the interval applies uniformly across all of them.
 
 CSV output:
-  dns_<domain>.csv  — DNS query results
+  dns_<domain>.csv  — DNS query results (+ HTTP columns when http_check=true)
   ping_<host>.csv   — ICMP ping results
 """
 
@@ -17,6 +17,8 @@ import os
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 import dns.resolver
@@ -76,12 +78,70 @@ def dns_lookup(domain: str, resolver: dns.resolver.Resolver) -> dict:
         }
 
 
+def http_get(domain: str, timeout: float) -> dict:
+    """Perform an HTTPS GET to *domain* and return timing + status information.
+
+    Falls back to plain HTTP if the HTTPS attempt raises an SSL or connection
+    error (not an HTTP-level error such as 4xx/5xx).
+    """
+    for scheme in ("https", "http"):
+        url = f"{scheme}://{domain}"
+        start = time.perf_counter()
+        try:
+            req = urllib.request.Request(url, method="GET",
+                                         headers={"User-Agent": "connectivity-tester/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                return {
+                    "http_success": resp.status == 200,
+                    "http_status_code": resp.status,
+                    "http_response_time_ms": round(elapsed_ms, 3),
+                    "http_error": "",
+                }
+        except urllib.error.HTTPError as exc:
+            # Server responded with a non-2xx code — that is a definitive answer.
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return {
+                "http_success": False,
+                "http_status_code": exc.code,
+                "http_response_time_ms": round(elapsed_ms, 3),
+                "http_error": f"HTTP {exc.code}: {exc.reason}",
+            }
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            last_error = str(exc)
+            last_elapsed = elapsed_ms
+            # Only fall through to http:// on SSL / connection failures.
+            if scheme == "https" and any(
+                kw in type(exc).__name__ for kw in ("SSL", "Certificate", "timeout")
+            ):
+                continue
+            return {
+                "http_success": False,
+                "http_status_code": 0,
+                "http_response_time_ms": round(elapsed_ms, 3),
+                "http_error": last_error,
+            }
+
+    return {
+        "http_success": False,
+        "http_status_code": 0,
+        "http_response_time_ms": round(last_elapsed, 3),
+        "http_error": last_error,
+    }
+
+
 def poll_dns(domain: str, interval: float, iterations: int,
-             output_file: str, resolver: dns.resolver.Resolver) -> None:
-    fieldnames = [
+             output_file: str, resolver: dns.resolver.Resolver,
+             http_check: bool = False, timeout: float = 5.0) -> None:
+    dns_fieldnames = [
         "timestamp", "domain", "success", "response_time_ms",
         "resolved_ip", "dns_server_ip", "dns_server_name", "error",
     ]
+    http_fieldnames = [
+        "http_success", "http_status_code", "http_response_time_ms", "http_error",
+    ]
+    fieldnames = dns_fieldnames + (http_fieldnames if http_check else [])
     pad = len(str(iterations))
 
     with open(output_file, "w", newline="") as f:
@@ -90,19 +150,35 @@ def poll_dns(domain: str, interval: float, iterations: int,
 
         for i in range(1, iterations + 1):
             timestamp = datetime.now().isoformat()
-            result = dns_lookup(domain, resolver)
-            writer.writerow({"timestamp": timestamp, "domain": domain, **result})
+            dns_result = dns_lookup(domain, resolver)
+            row = {"timestamp": timestamp, "domain": domain, **dns_result}
+
+            http_result: dict = {}
+            if http_check:
+                http_result = http_get(domain, timeout)
+                row.update(http_result)
+
+            writer.writerow(row)
             f.flush()
 
-            status = "OK  " if result["success"] else "FAIL"
-            ns = result["dns_server_name"] or result["dns_server_ip"] or "-"
-            _print(
+            dns_status = "OK  " if dns_result["success"] else "FAIL"
+            ns = dns_result["dns_server_name"] or dns_result["dns_server_ip"] or "-"
+            line = (
                 f"  [dns  {domain}  {i:>{pad}}/{iterations}]"
-                f"  {timestamp}  {status}"
-                f"  {result['response_time_ms']:7.1f} ms"
-                f"  {result['resolved_ip'] or result['error']}"
+                f"  {timestamp}"
+                f"  DNS:{dns_status} {dns_result['response_time_ms']:7.1f} ms"
+                f"  {dns_result['resolved_ip'] or dns_result['error']}"
                 f"  (ns: {ns})"
             )
+            if http_check:
+                code = http_result["http_status_code"]
+                h_ms = http_result["http_response_time_ms"]
+                h_ok = "OK  " if http_result["http_success"] else "FAIL"
+                line += (
+                    f"  |  HTTP:{h_ok} {h_ms:7.1f} ms"
+                    f"  [{code or http_result['http_error']}]"
+                )
+            _print(line)
 
             if i < iterations:
                 time.sleep(interval)
@@ -255,11 +331,13 @@ def main() -> None:
     timeout: float = config.get("timeout", 5.0)
     domains: list[str] = config.get("domains", [])
     ping_hosts: list[str] = config.get("ping_hosts", [])
+    http_check: bool = bool(config.get("http_check", False))
 
     print(f"Config     : {args.config}")
     print(f"Interval   : {interval}s  |  Iterations: {iterations}  |  Timeout: {timeout}s")
     if domains:
-        print(f"DNS domains: {', '.join(domains)}")
+        print(f"DNS domains: {', '.join(domains)}"
+              + ("  (+HTTP check)" if http_check else ""))
         if "dns_server" in config:
             print(f"DNS server : {config['dns_server']}")
     if ping_hosts:
@@ -274,7 +352,7 @@ def main() -> None:
         output_file = f"dns_{safe_filename(domain)}.csv"
         t = threading.Thread(
             target=poll_dns,
-            args=(domain, interval, iterations, output_file, resolver),
+            args=(domain, interval, iterations, output_file, resolver, http_check, timeout),
             name=f"dns-{domain}",
             daemon=True,
         )
