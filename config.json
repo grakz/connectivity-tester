@@ -1,0 +1,10 @@
+{
+  "interval": 5.0,
+  "iterations": 10,
+  "domains": [
+    "www.google.com",
+    "www.github.com",
+    "www.cloudflare.com"
+  ],
+  "timeout": 5.0
+}
