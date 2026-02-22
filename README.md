@@ -138,14 +138,51 @@ Rows appear in the same order as targets are declared in the config (`domains` f
 
 Response times of exactly `0 ms` (e.g. a ping that received no reply) are excluded from the timing statistics so they don't distort the averages.
 
+## Live summary viewer
+
+`summary_viewer.py` renders `summary.csv` as a formatted table in the terminal and automatically redraws it whenever the file changes on disk. Run it in a second terminal while the poller is running:
+
+```bash
+python3 summary_viewer.py            # watches ./summary.csv
+python3 summary_viewer.py --file /path/to/summary.csv
+python3 summary_viewer.py --interval 1   # check for changes every 1 s (default 0.5)
+```
+
+Example output:
+
+```
+Summary: /home/user/connectivity-tester/summary.csv
+file updated 2026-02-22 10:00:30  ·  viewer checked 2026-02-22 10:00:30  ·  Ctrl-C to quit
+
+target          type   total  successes  errors  error %  avg ms  min ms  max ms
+─────────────────────────────────────────────────────────────────────────────────
+www.google.com  dns       10         10       0      0.0   18.4    12.1    31.7
+www.google.com  http      10         10       0      0.0   87.2    71.3   143.6
+8.8.8.8         ping      10         10       0      0.0   12.3     9.8    18.1
+1.1.1.1         ping       9          8       1     11.1   10.1     8.4    19.2
+```
+
+The `error %` column is colour-coded: green for 0 %, yellow for < 20 %, red for ≥ 20 %. The viewer starts immediately even if the file does not exist yet and displays a "Waiting…" message until the poller creates it.
+
 ## Command-line options
 
+**`dns_poller.py`**
 ```
 usage: dns_poller.py [-h] [--config FILE]
 
 options:
   -h, --help     show this help message and exit
   --config FILE  Path to JSON config file (default: config.json)
+```
+
+**`summary_viewer.py`**
+```
+usage: summary_viewer.py [-h] [--file FILE] [--interval SECS]
+
+options:
+  -h, --help        show this help message and exit
+  --file FILE       Path to the summary CSV file (default: summary.csv)
+  --interval SECS   How often to check for file changes in seconds (default: 0.5)
 ```
 
 ## Example console output
