@@ -9,6 +9,7 @@ A lightweight Python polling tool that continuously monitors network connectivit
 - **ICMP ping** — sends ICMP echo requests to any IP address or hostname
 - **Concurrent polling** — all targets run in parallel threads, so the interval applies uniformly across every target
 - **Per-target CSV output** — one CSV file per domain or host, flushed after every poll so data is never lost mid-run
+- **Live summary CSV** — `summary.csv` is rewritten after every poll cycle with aggregate stats (totals, error rate, avg/min/max response times) across all targets
 
 ## Requirements
 
@@ -116,6 +117,26 @@ When `http_check` is `true` the tool attempts an `HTTPS` GET to `https://<domain
 - A DNS failure does **not** prevent the HTTP check from running.
 - The HTTP response time covers the full round trip from sending the request to receiving the response headers (body is not downloaded).
 - `http_success` is `True` only when the final HTTP status code is exactly `200`.
+
+## Summary file — `summary.csv`
+
+Always written to the current working directory. It contains one row per (target, check type) combination and is fully rewritten and flushed after **every individual poll result**, so it is always up to date even during a long run.
+
+| Column | Description |
+|---|---|
+| `target` | Domain name or host address |
+| `type` | `dns`, `http`, or `ping` |
+| `total` | Total polls completed so far |
+| `successes` | Polls that succeeded |
+| `errors` | Polls that failed |
+| `error_rate_pct` | `errors / total × 100`, rounded to one decimal place |
+| `avg_response_time_ms` | Mean response time across all timed measurements |
+| `min_response_time_ms` | Fastest recorded response time |
+| `max_response_time_ms` | Slowest recorded response time |
+
+Rows appear in the same order as targets are declared in the config (`domains` first, then `ping_hosts`). For domains with `http_check` enabled, the `dns` row is immediately followed by its `http` row.
+
+Response times of exactly `0 ms` (e.g. a ping that received no reply) are excluded from the timing statistics so they don't distort the averages.
 
 ## Command-line options
 

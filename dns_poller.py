@@ -39,6 +39,99 @@ def _print(*args, **kwargs) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Summary tracking
+# ---------------------------------------------------------------------------
+
+class _Stats:
+    """Running totals for one (target, check-type) pair."""
+    __slots__ = ("successes", "errors", "_sum", "_min", "_max")
+
+    def __init__(self) -> None:
+        self.successes = 0
+        self.errors = 0
+        self._sum = 0.0
+        self._min = float("inf")
+        self._max = 0.0
+
+    def add(self, success: bool, response_time_ms: float) -> None:
+        if success:
+            self.successes += 1
+        else:
+            self.errors += 1
+        # Only count timing when we actually measured something (not a 0-ms placeholder).
+        if response_time_ms > 0:
+            self._sum += response_time_ms
+            if response_time_ms < self._min:
+                self._min = response_time_ms
+            if response_time_ms > self._max:
+                self._max = response_time_ms
+
+    @property
+    def total(self) -> int:
+        return self.successes + self.errors
+
+    @property
+    def error_rate_pct(self) -> float:
+        return round(self.errors / self.total * 100, 1) if self.total else 0.0
+
+    @property
+    def avg_ms(self) -> float:
+        timed = self.total if self._max > 0 else 0
+        return round(self._sum / timed, 3) if timed else 0.0
+
+    @property
+    def min_ms(self) -> float:
+        return round(self._min, 3) if self._min != float("inf") else 0.0
+
+    @property
+    def max_ms(self) -> float:
+        return round(self._max, 3)
+
+
+class SummaryTracker:
+    """Accumulates per-target statistics and rewrites summary.csv after every update."""
+
+    FIELDNAMES = [
+        "target", "type", "total", "successes", "errors",
+        "error_rate_pct", "avg_response_time_ms", "min_response_time_ms", "max_response_time_ms",
+    ]
+
+    def __init__(self, output_file: str = "summary.csv") -> None:
+        self._path = output_file
+        self._lock = threading.Lock()
+        # Insertion-ordered dict so rows appear in registration order.
+        self._data: dict[tuple[str, str], _Stats] = {}
+
+    def register(self, target: str, check_type: str) -> None:
+        """Pre-register a key to lock in its row position before polling starts."""
+        self._data[(target, check_type)] = _Stats()
+
+    def update(self, target: str, check_type: str,
+               success: bool, response_time_ms: float) -> None:
+        with self._lock:
+            self._data[(target, check_type)].add(success, response_time_ms)
+            self._flush()
+
+    def _flush(self) -> None:
+        """Rewrite the CSV atomically. Must be called with self._lock held."""
+        with open(self._path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
+            writer.writeheader()
+            for (target, check_type), stats in self._data.items():
+                writer.writerow({
+                    "target": target,
+                    "type": check_type,
+                    "total": stats.total,
+                    "successes": stats.successes,
+                    "errors": stats.errors,
+                    "error_rate_pct": stats.error_rate_pct,
+                    "avg_response_time_ms": stats.avg_ms,
+                    "min_response_time_ms": stats.min_ms,
+                    "max_response_time_ms": stats.max_ms,
+                })
+
+
+# ---------------------------------------------------------------------------
 # DNS
 # ---------------------------------------------------------------------------
 
@@ -133,7 +226,8 @@ def http_get(domain: str, timeout: float) -> dict:
 
 def poll_dns(domain: str, interval: float, iterations: int,
              output_file: str, resolver: dns.resolver.Resolver,
-             http_check: bool = False, timeout: float = 5.0) -> None:
+             http_check: bool = False, timeout: float = 5.0,
+             summary: SummaryTracker | None = None) -> None:
     dns_fieldnames = [
         "timestamp", "domain", "success", "response_time_ms",
         "resolved_ip", "dns_server_ip", "dns_server_name", "error",
@@ -153,10 +247,16 @@ def poll_dns(domain: str, interval: float, iterations: int,
             dns_result = dns_lookup(domain, resolver)
             row = {"timestamp": timestamp, "domain": domain, **dns_result}
 
+            if summary:
+                summary.update(domain, "dns", dns_result["success"], dns_result["response_time_ms"])
+
             http_result: dict = {}
             if http_check:
                 http_result = http_get(domain, timeout)
                 row.update(http_result)
+                if summary:
+                    summary.update(domain, "http", http_result["http_success"],
+                                   http_result["http_response_time_ms"])
 
             writer.writerow(row)
             f.flush()
@@ -232,7 +332,8 @@ def ping_host(host: str, timeout: float) -> dict:
 
 
 def poll_ping(host: str, interval: float, iterations: int,
-              output_file: str, timeout: float) -> None:
+              output_file: str, timeout: float,
+              summary: SummaryTracker | None = None) -> None:
     fieldnames = [
         "timestamp", "host", "success", "response_time_ms",
         "packets_sent", "packets_received", "error",
@@ -248,6 +349,8 @@ def poll_ping(host: str, interval: float, iterations: int,
             result = ping_host(host, timeout)
             writer.writerow({"timestamp": timestamp, "host": host, **result})
             f.flush()
+            if summary:
+                summary.update(host, "ping", result["success"], result["response_time_ms"])
 
             status = "OK  " if result["success"] else "FAIL"
             _print(
@@ -342,9 +445,19 @@ def main() -> None:
             print(f"DNS server : {config['dns_server']}")
     if ping_hosts:
         print(f"Ping hosts : {', '.join(ping_hosts)}")
+    print(f"Summary    : summary.csv")
     print()
 
     resolver = build_resolver(config) if domains else None
+
+    # Pre-register targets in config order so summary rows are always stable.
+    summary = SummaryTracker("summary.csv")
+    for domain in domains:
+        summary.register(domain, "dns")
+        if http_check:
+            summary.register(domain, "http")
+    for host in ping_hosts:
+        summary.register(host, "ping")
 
     threads: list[threading.Thread] = []
 
@@ -352,7 +465,8 @@ def main() -> None:
         output_file = f"dns_{safe_filename(domain)}.csv"
         t = threading.Thread(
             target=poll_dns,
-            args=(domain, interval, iterations, output_file, resolver, http_check, timeout),
+            args=(domain, interval, iterations, output_file, resolver,
+                  http_check, timeout, summary),
             name=f"dns-{domain}",
             daemon=True,
         )
@@ -362,7 +476,7 @@ def main() -> None:
         output_file = f"ping_{safe_filename(host)}.csv"
         t = threading.Thread(
             target=poll_ping,
-            args=(host, interval, iterations, output_file, timeout),
+            args=(host, interval, iterations, output_file, timeout, summary),
             name=f"ping-{host}",
             daemon=True,
         )
