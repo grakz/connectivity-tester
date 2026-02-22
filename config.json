@@ -1,10 +1,16 @@
 {
   "interval": 5.0,
   "iterations": 10,
+  "timeout": 5.0,
+  "dns_server": "8.8.8.8",
   "domains": [
     "www.google.com",
     "www.github.com",
     "www.cloudflare.com"
   ],
-  "timeout": 5.0
+  "ping_hosts": [
+    "8.8.8.8",
+    "1.1.1.1",
+    "2606:4700:4700::1111"
+  ]
 }

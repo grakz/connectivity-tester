@@ -1,20 +1,44 @@
 #!/usr/bin/env python3
-"""DNS polling script driven by a JSON config file.
+"""Connectivity poller driven by a JSON config file.
 
-Reads polling settings from config.json (or a path given via --config),
-queries each domain at the specified interval, and writes per-domain CSV files.
+Polls one or more DNS domains and/or ICMP ping hosts at a configurable
+interval. Each target gets its own CSV file. All targets are polled
+concurrently so the interval applies uniformly across all of them.
+
+CSV output:
+  dns_<domain>.csv  — DNS query results
+  ping_<host>.csv   — ICMP ping results
 """
 
 import argparse
 import csv
 import json
+import os
 import sys
+import threading
 import time
 from datetime import datetime
 
 import dns.resolver
 import dns.reversename
+from icmplib import ping as icmp_ping
+from icmplib import SocketPermissionError
 
+# Use raw ICMP sockets when running as root, UDP otherwise (no root needed).
+_PRIVILEGED = os.geteuid() == 0
+
+# Lock so concurrent threads don't interleave their console output.
+_print_lock = threading.Lock()
+
+
+def _print(*args, **kwargs) -> None:
+    with _print_lock:
+        print(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# DNS
+# ---------------------------------------------------------------------------
 
 def reverse_lookup(ip: str) -> str:
     """Return the PTR hostname for an IP, or the IP itself if lookup fails."""
@@ -27,25 +51,17 @@ def reverse_lookup(ip: str) -> str:
 
 
 def dns_lookup(domain: str, resolver: dns.resolver.Resolver) -> dict:
-    """
-    Resolve *domain* using *resolver*.
-
-    Returns a dict with keys:
-        success, response_time_ms, resolved_ip, dns_server_ip, dns_server_name, error
-    """
     start = time.perf_counter()
     try:
         answer = resolver.resolve(domain, "A")
         elapsed_ms = (time.perf_counter() - start) * 1000
-        resolved_ip = str(answer[0])
-        ns_ip = answer.nameserver  # IP of the server that answered
-        ns_name = reverse_lookup(ns_ip)
+        ns_ip = answer.nameserver
         return {
             "success": True,
             "response_time_ms": round(elapsed_ms, 3),
-            "resolved_ip": resolved_ip,
+            "resolved_ip": str(answer[0]),
             "dns_server_ip": ns_ip,
-            "dns_server_name": ns_name,
+            "dns_server_name": reverse_lookup(ns_ip),
             "error": "",
         }
     except Exception as exc:
@@ -60,23 +76,13 @@ def dns_lookup(domain: str, resolver: dns.resolver.Resolver) -> dict:
         }
 
 
-def poll_domain(
-    domain: str,
-    interval: float,
-    iterations: int,
-    output_file: str,
-    resolver: dns.resolver.Resolver,
-) -> None:
+def poll_dns(domain: str, interval: float, iterations: int,
+             output_file: str, resolver: dns.resolver.Resolver) -> None:
     fieldnames = [
-        "timestamp",
-        "domain",
-        "success",
-        "response_time_ms",
-        "resolved_ip",
-        "dns_server_ip",
-        "dns_server_name",
-        "error",
+        "timestamp", "domain", "success", "response_time_ms",
+        "resolved_ip", "dns_server_ip", "dns_server_name", "error",
     ]
+    pad = len(str(iterations))
 
     with open(output_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -85,16 +91,15 @@ def poll_domain(
         for i in range(1, iterations + 1):
             timestamp = datetime.now().isoformat()
             result = dns_lookup(domain, resolver)
-
-            row = {"timestamp": timestamp, "domain": domain, **result}
-            writer.writerow(row)
+            writer.writerow({"timestamp": timestamp, "domain": domain, **result})
             f.flush()
 
             status = "OK  " if result["success"] else "FAIL"
             ns = result["dns_server_name"] or result["dns_server_ip"] or "-"
-            print(
-                f"  [{i:>{len(str(iterations))}}/{iterations}] {timestamp}"
-                f"  {status}  {result['response_time_ms']:7.1f} ms"
+            _print(
+                f"  [dns  {domain}  {i:>{pad}}/{iterations}]"
+                f"  {timestamp}  {status}"
+                f"  {result['response_time_ms']:7.1f} ms"
                 f"  {result['resolved_ip'] or result['error']}"
                 f"  (ns: {ns})"
             )
@@ -102,24 +107,112 @@ def poll_domain(
             if i < iterations:
                 time.sleep(interval)
 
-    print(f"  -> saved to {output_file}\n")
+    _print(f"  -> {output_file} written\n")
 
+
+# ---------------------------------------------------------------------------
+# ICMP ping
+# ---------------------------------------------------------------------------
+
+def ping_host(host: str, timeout: float) -> dict:
+    try:
+        result = icmp_ping(host, count=1, timeout=timeout, privileged=_PRIVILEGED)
+        rtt = round(result.avg_rtt, 3) if result.is_alive else 0.0
+        return {
+            "success": result.is_alive,
+            "response_time_ms": rtt,
+            "packets_sent": result.packets_sent,
+            "packets_received": result.packets_received,
+            "error": "",
+        }
+    except SocketPermissionError:
+        # Fallback: retry without privileged raw sockets
+        try:
+            result = icmp_ping(host, count=1, timeout=timeout, privileged=False)
+            rtt = round(result.avg_rtt, 3) if result.is_alive else 0.0
+            return {
+                "success": result.is_alive,
+                "response_time_ms": rtt,
+                "packets_sent": result.packets_sent,
+                "packets_received": result.packets_received,
+                "error": "",
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "response_time_ms": 0.0,
+                "packets_sent": 1,
+                "packets_received": 0,
+                "error": str(exc),
+            }
+    except Exception as exc:
+        return {
+            "success": False,
+            "response_time_ms": 0.0,
+            "packets_sent": 1,
+            "packets_received": 0,
+            "error": str(exc),
+        }
+
+
+def poll_ping(host: str, interval: float, iterations: int,
+              output_file: str, timeout: float) -> None:
+    fieldnames = [
+        "timestamp", "host", "success", "response_time_ms",
+        "packets_sent", "packets_received", "error",
+    ]
+    pad = len(str(iterations))
+
+    with open(output_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for i in range(1, iterations + 1):
+            timestamp = datetime.now().isoformat()
+            result = ping_host(host, timeout)
+            writer.writerow({"timestamp": timestamp, "host": host, **result})
+            f.flush()
+
+            status = "OK  " if result["success"] else "FAIL"
+            _print(
+                f"  [ping {host}  {i:>{pad}}/{iterations}]"
+                f"  {timestamp}  {status}"
+                f"  {result['response_time_ms']:7.1f} ms"
+                f"  {result['error'] if not result['success'] else ''}"
+            )
+
+            if i < iterations:
+                time.sleep(interval)
+
+    _print(f"  -> {output_file} written\n")
+
+
+# ---------------------------------------------------------------------------
+# Config / helpers
+# ---------------------------------------------------------------------------
 
 def load_config(path: str) -> dict:
     with open(path) as f:
         config = json.load(f)
 
-    missing = [k for k in ("interval", "iterations", "domains") if k not in config]
+    missing = [k for k in ("interval", "iterations") if k not in config]
     if missing:
         sys.exit(f"Config missing required keys: {', '.join(missing)}")
-    if not isinstance(config["domains"], list) or not config["domains"]:
-        sys.exit("Config 'domains' must be a non-empty list.")
+
+    domains = config.get("domains", [])
+    ping_hosts = config.get("ping_hosts", [])
+
+    if not domains and not ping_hosts:
+        sys.exit("Config must contain at least one of 'domains' or 'ping_hosts'.")
+    if not isinstance(domains, list):
+        sys.exit("Config 'domains' must be a list.")
+    if not isinstance(ping_hosts, list):
+        sys.exit("Config 'ping_hosts' must be a list.")
 
     return config
 
 
 def build_resolver(config: dict) -> dns.resolver.Resolver:
-    """Build a resolver, optionally using a custom DNS server from config."""
     if "dns_server" in config:
         resolver = dns.resolver.Resolver(configure=False)
         resolver.nameservers = [config["dns_server"]]
@@ -129,26 +222,29 @@ def build_resolver(config: dict) -> dns.resolver.Resolver:
         except dns.resolver.NoResolverConfiguration:
             sys.exit(
                 "No system DNS resolver found. "
-                "Add a \"dns_server\" key to your config (e.g. \"8.8.8.8\")."
+                'Add a "dns_server" key to your config (e.g. "8.8.8.8").'
             )
     resolver.lifetime = config.get("timeout", 5.0)
     return resolver
 
 
-def domain_to_filename(domain: str) -> str:
-    """Convert a domain name to a safe CSV filename."""
-    safe = domain.replace(":", "_").replace("/", "_").replace("\\", "_")
-    return f"{safe}.csv"
+def safe_filename(name: str) -> str:
+    """Replace characters that are awkward in filenames."""
+    for ch in (":", "/", "\\", "*", "?", '"', "<", ">", "|"):
+        name = name.replace(ch, "_")
+    return name
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Poll DNS for one or more domains and record results to CSV files."
+        description="Poll DNS domains and/or ICMP ping hosts; write per-target CSV files."
     )
     parser.add_argument(
-        "--config",
-        default="config.json",
-        metavar="FILE",
+        "--config", default="config.json", metavar="FILE",
         help="Path to JSON config file (default: config.json)",
     )
     args = parser.parse_args()
@@ -156,21 +252,48 @@ def main() -> None:
     config = load_config(args.config)
     interval: float = config["interval"]
     iterations: int = config["iterations"]
-    domains: list[str] = config["domains"]
-    resolver = build_resolver(config)
+    timeout: float = config.get("timeout", 5.0)
+    domains: list[str] = config.get("domains", [])
+    ping_hosts: list[str] = config.get("ping_hosts", [])
 
-    print(f"Config : {args.config}")
-    print(f"Interval   : {interval}s")
-    print(f"Iterations : {iterations}")
-    print(f"Domains    : {', '.join(domains)}")
-    if "dns_server" in config:
-        print(f"DNS server : {config['dns_server']}")
+    print(f"Config     : {args.config}")
+    print(f"Interval   : {interval}s  |  Iterations: {iterations}  |  Timeout: {timeout}s")
+    if domains:
+        print(f"DNS domains: {', '.join(domains)}")
+        if "dns_server" in config:
+            print(f"DNS server : {config['dns_server']}")
+    if ping_hosts:
+        print(f"Ping hosts : {', '.join(ping_hosts)}")
     print()
 
+    resolver = build_resolver(config) if domains else None
+
+    threads: list[threading.Thread] = []
+
     for domain in domains:
-        output_file = domain_to_filename(domain)
-        print(f"Polling '{domain}' -> {output_file}")
-        poll_domain(domain, interval, iterations, output_file, resolver)
+        output_file = f"dns_{safe_filename(domain)}.csv"
+        t = threading.Thread(
+            target=poll_dns,
+            args=(domain, interval, iterations, output_file, resolver),
+            name=f"dns-{domain}",
+            daemon=True,
+        )
+        threads.append(t)
+
+    for host in ping_hosts:
+        output_file = f"ping_{safe_filename(host)}.csv"
+        t = threading.Thread(
+            target=poll_ping,
+            args=(host, interval, iterations, output_file, timeout),
+            name=f"ping-{host}",
+            daemon=True,
+        )
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 if __name__ == "__main__":
