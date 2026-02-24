@@ -243,6 +243,7 @@ def poll_dns(domain: str, interval: float, iterations: int,
         writer.writeheader()
 
         for i in range(1, iterations + 1):
+            iter_start = time.perf_counter()
             timestamp = datetime.now().isoformat()
             dns_result = dns_lookup(domain, resolver)
             row = {"timestamp": timestamp, "domain": domain, **dns_result}
@@ -281,7 +282,9 @@ def poll_dns(domain: str, interval: float, iterations: int,
             _print(line)
 
             if i < iterations:
-                time.sleep(interval)
+                remaining = interval - (time.perf_counter() - iter_start)
+                if remaining > 0:
+                    time.sleep(remaining)
 
     _print(f"  -> {output_file} written\n")
 
@@ -345,6 +348,7 @@ def poll_ping(host: str, interval: float, iterations: int,
         writer.writeheader()
 
         for i in range(1, iterations + 1):
+            iter_start = time.perf_counter()
             timestamp = datetime.now().isoformat()
             result = ping_host(host, timeout)
             writer.writerow({"timestamp": timestamp, "host": host, **result})
@@ -361,7 +365,9 @@ def poll_ping(host: str, interval: float, iterations: int,
             )
 
             if i < iterations:
-                time.sleep(interval)
+                remaining = interval - (time.perf_counter() - iter_start)
+                if remaining > 0:
+                    time.sleep(remaining)
 
     _print(f"  -> {output_file} written\n")
 
