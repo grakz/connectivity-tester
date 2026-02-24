@@ -13,6 +13,7 @@ CSV output:
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import threading
@@ -227,7 +228,8 @@ def http_get(domain: str, timeout: float) -> dict:
 def poll_dns(domain: str, interval: float, iterations: int,
              output_file: str, resolver: dns.resolver.Resolver,
              http_check: bool = False, timeout: float = 5.0,
-             summary: SummaryTracker | None = None) -> None:
+             summary: SummaryTracker | None = None,
+             schedule_start: float | None = None) -> None:
     dns_fieldnames = [
         "timestamp", "domain", "success", "response_time_ms",
         "resolved_ip", "dns_server_ip", "dns_server_name", "error",
@@ -238,11 +240,19 @@ def poll_dns(domain: str, interval: float, iterations: int,
     fieldnames = dns_fieldnames + (http_fieldnames if http_check else [])
     pad = len(str(iterations))
 
+    t0 = schedule_start if schedule_start is not None else time.monotonic()
+
     with open(output_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
+        next_slot = 0  # index of the next target tick: t0 + next_slot * interval
         for i in range(1, iterations + 1):
+            # Sleep until the next aligned slot on the shared tick grid.
+            wait = (t0 + next_slot * interval) - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+
             timestamp = datetime.now().isoformat()
             dns_result = dns_lookup(domain, resolver)
             row = {"timestamp": timestamp, "domain": domain, **dns_result}
@@ -280,8 +290,8 @@ def poll_dns(domain: str, interval: float, iterations: int,
                 )
             _print(line)
 
-            if i < iterations:
-                time.sleep(interval)
+            # Advance to the first slot that is strictly in the future.
+            next_slot = math.floor((time.monotonic() - t0) / interval) + 1
 
     _print(f"  -> {output_file} written\n")
 
@@ -333,18 +343,27 @@ def ping_host(host: str, timeout: float) -> dict:
 
 def poll_ping(host: str, interval: float, iterations: int,
               output_file: str, timeout: float,
-              summary: SummaryTracker | None = None) -> None:
+              summary: SummaryTracker | None = None,
+              schedule_start: float | None = None) -> None:
     fieldnames = [
         "timestamp", "host", "success", "response_time_ms",
         "packets_sent", "packets_received", "error",
     ]
     pad = len(str(iterations))
 
+    t0 = schedule_start if schedule_start is not None else time.monotonic()
+
     with open(output_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
+        next_slot = 0  # index of the next target tick: t0 + next_slot * interval
         for i in range(1, iterations + 1):
+            # Sleep until the next aligned slot on the shared tick grid.
+            wait = (t0 + next_slot * interval) - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+
             timestamp = datetime.now().isoformat()
             result = ping_host(host, timeout)
             writer.writerow({"timestamp": timestamp, "host": host, **result})
@@ -360,8 +379,8 @@ def poll_ping(host: str, interval: float, iterations: int,
                 f"  {result['error'] if not result['success'] else ''}"
             )
 
-            if i < iterations:
-                time.sleep(interval)
+            # Advance to the first slot that is strictly in the future.
+            next_slot = math.floor((time.monotonic() - t0) / interval) + 1
 
     _print(f"  -> {output_file} written\n")
 
@@ -459,6 +478,9 @@ def main() -> None:
     for host in ping_hosts:
         summary.register(host, "ping")
 
+    # Shared anchor for the tick grid — all threads target t0 + n*interval.
+    schedule_start = time.monotonic()
+
     threads: list[threading.Thread] = []
 
     for domain in domains:
@@ -466,7 +488,7 @@ def main() -> None:
         t = threading.Thread(
             target=poll_dns,
             args=(domain, interval, iterations, output_file, resolver,
-                  http_check, timeout, summary),
+                  http_check, timeout, summary, schedule_start),
             name=f"dns-{domain}",
             daemon=True,
         )
@@ -476,7 +498,8 @@ def main() -> None:
         output_file = f"ping_{safe_filename(host)}.csv"
         t = threading.Thread(
             target=poll_ping,
-            args=(host, interval, iterations, output_file, timeout, summary),
+            args=(host, interval, iterations, output_file, timeout,
+                  summary, schedule_start),
             name=f"ping-{host}",
             daemon=True,
         )
