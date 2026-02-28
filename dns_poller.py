@@ -95,31 +95,77 @@ class ResultsWriter:
     """Thread-safe combined results CSV.
 
     One row per time slot; all targets contribute their own column group
-    (<target>_<type>_<field>) to the same row.  The file is rewritten and
-    flushed after every individual measurement so it is always current.
+    (<target>_<type>_<field>) to the same row.
+
+    Each slot row is written exactly once — appended to the file the moment
+    every polling thread has moved past that slot (i.e. no thread can still
+    contribute data to it).  This keeps the per-measurement I/O cost O(1)
+    regardless of how many slots have accumulated, preventing the CPU/IO
+    load from growing over time.
     """
 
-    def __init__(self, output_file: str, fieldnames: list[str]) -> None:
-        self._path = output_file
+    def __init__(self, output_file: str, fieldnames: list[str],
+                 n_writers: int, on_slot_complete=None) -> None:
         self._fieldnames = fieldnames
-        self._lock = threading.Lock()
-        self._rows: dict[int, dict] = {}  # slot_index -> partial row
+        self._n_writers  = n_writers
+        self._lock       = threading.Lock()
+        self._rows: dict[int, dict] = {}       # slot -> partial row data
+        self._thread_hwm: dict[int, int] = {}  # thread ident -> highest slot written
+        self._next_flush = 0                   # next slot index to append to file
+
+        # Truncate (or create) the file and write the header once.
+        # Then re-open in append mode and keep the handle for the run's lifetime.
+        with open(output_file, "w", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=fieldnames, restval="").writeheader()
+        self._fh               = open(output_file, "a", newline="")  # noqa: SIM115
+        self._writer           = csv.DictWriter(self._fh, fieldnames=fieldnames, restval="")
+        self._on_slot_complete = on_slot_complete  # called once per completed slot
 
     def record(self, slot: int, data: dict) -> None:
-        """Merge *data* into the row for *slot* and rewrite the file."""
+        """Merge *data* into the row for *slot*; append completed rows."""
+        tid = threading.current_thread().ident
         with self._lock:
-            if slot not in self._rows:
-                self._rows[slot] = {"slot": slot}
-            self._rows[slot].update(data)
-            self._flush()
+            self._rows.setdefault(slot, {"slot": slot}).update(data)
+            # Advance this thread's high-water mark.
+            if slot > self._thread_hwm.get(tid, -1):
+                self._thread_hwm[tid] = slot
+            self._maybe_flush()
 
-    def _flush(self) -> None:
-        """Rewrite the CSV. Must be called with self._lock held."""
-        with open(self._path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=self._fieldnames, restval="")
-            writer.writeheader()
+    def _maybe_flush(self) -> None:
+        """Append every slot that all threads have moved past.
+
+        Must be called with self._lock held.
+        A slot is 'done' once every writer's high-water mark is strictly
+        greater than that slot — guaranteeing no further data will arrive.
+        We wait until all n_writers have registered before flushing so that
+        a fast early thread cannot finalise slots before slower ones start.
+        """
+        if len(self._thread_hwm) < self._n_writers:
+            return
+        frontier      = min(self._thread_hwm.values())
+        slots_written = 0
+        while self._next_flush < frontier:
+            if self._next_flush in self._rows:
+                self._writer.writerow(self._rows.pop(self._next_flush))
+                slots_written += 1
+            self._next_flush += 1
+        if slots_written:
+            self._fh.flush()
+            if self._on_slot_complete:
+                self._on_slot_complete()
+
+    def finalize(self) -> None:
+        """Flush any remaining buffered rows once all threads have finished."""
+        rows_written = 0
+        with self._lock:
             for slot in sorted(self._rows):
-                writer.writerow(self._rows[slot])
+                self._writer.writerow(self._rows[slot])
+                rows_written += 1
+            self._rows.clear()
+            self._fh.flush()
+            self._fh.close()
+        if rows_written and self._on_slot_complete:
+            self._on_slot_complete()
 
 
 class SummaryTracker:
@@ -142,27 +188,28 @@ class SummaryTracker:
 
     def update(self, target: str, check_type: str,
                success: bool, response_time_ms: float) -> None:
+        """Update in-memory stats only. summary.csv is written by flush()."""
         with self._lock:
             self._data[(target, check_type)].add(success, response_time_ms)
-            self._flush()
 
-    def _flush(self) -> None:
-        """Rewrite the CSV atomically. Must be called with self._lock held."""
-        with open(self._path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
-            writer.writeheader()
-            for (target, check_type), stats in self._data.items():
-                writer.writerow({
-                    "target": target,
-                    "type": check_type,
-                    "total": stats.total,
-                    "successes": stats.successes,
-                    "errors": stats.errors,
-                    "error_rate_pct": stats.error_rate_pct,
-                    "avg_response_time_ms": stats.avg_ms,
-                    "min_response_time_ms": stats.min_ms,
-                    "max_response_time_ms": stats.max_ms,
-                })
+    def flush(self) -> None:
+        """Rewrite summary.csv with the current accumulated stats."""
+        with self._lock:
+            with open(self._path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES)
+                writer.writeheader()
+                for (target, check_type), stats in self._data.items():
+                    writer.writerow({
+                        "target": target,
+                        "type": check_type,
+                        "total": stats.total,
+                        "successes": stats.successes,
+                        "errors": stats.errors,
+                        "error_rate_pct": stats.error_rate_pct,
+                        "avg_response_time_ms": stats.avg_ms,
+                        "min_response_time_ms": stats.min_ms,
+                        "max_response_time_ms": stats.max_ms,
+                    })
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +596,9 @@ def main() -> None:
         for col in ["timestamp", "success", "response_time_ms",
                     "packets_sent", "packets_received", "error"]:
             fieldnames.append(f"{host}_ping_{col}")
-    results_writer = ResultsWriter("results.csv", fieldnames)
+    n_writers      = len(domains) + len(ping_hosts)
+    results_writer = ResultsWriter("results.csv", fieldnames, n_writers,
+                                   on_slot_complete=summary.flush)
 
     # Shared anchor for the tick grid — all threads target t0 + n*interval.
     schedule_start = time.monotonic()
@@ -581,6 +630,10 @@ def main() -> None:
         t.start()
     for t in threads:
         t.join()
+
+    # Flush any slots that were buffered but never moved past by all threads
+    # (e.g. the very last slot of the run).
+    results_writer.finalize()
 
     print(f"\n  -> results.csv written ({iterations} slots)")
     print(f"  -> summary.csv written")
