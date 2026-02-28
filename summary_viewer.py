@@ -17,8 +17,8 @@ with outlier removal, so the event threshold stays fixed for the whole run.
 Keyboard shortcuts (shown in the on-screen tooltip):
     a   previous timing event
     d   next timing event
-    w   increase sigma by 0.5  (min 2.0)
-    s   decrease sigma by 0.5  (min 2.0)
+    w   increase sigma by 1  (min 2.0)
+    s   decrease sigma by 1  (min 2.0)
 """
 
 import argparse
@@ -210,8 +210,10 @@ def _process_results(rows: list[dict], sigma: float = 2.0,
                 continue
             m1 = statistics.mean(vals)
             s1 = statistics.stdev(vals)
-            # Remove outliers beyond sigma·stdev and recompute.
-            clean = [v for v in vals if abs(v - m1) <= sigma * s1]
+            # Remove outliers beyond 2·stdev and recompute.
+            # Always uses sigma=2 regardless of the user's detection sigma,
+            # so the baseline mean/stdev are stable and independent of it.
+            clean = [v for v in vals if abs(v - m1) <= 2.0 * s1]
             if len(clean) >= 2:
                 m2 = statistics.mean(clean)
                 s2 = statistics.stdev(clean)
@@ -298,7 +300,7 @@ def _render_baseline_table(data: dict) -> str:
     header = "  ".join(_hdr(h, i) for i, h in enumerate(headers))
     lines  = [
         f"{_BOLD}Baseline{_RESET}  "
-        f"{_DIM}(frozen from first 100 iterations, \u03c3={sigma:g}){_RESET}",
+        f"{_DIM}(frozen from first 100 iterations, outlier removal \u03c3=2){_RESET}",
         f"  {header}",
         f"  {sep}",
     ]
@@ -541,8 +543,8 @@ def main() -> None:
         tip = (
             f"  {_DIM}a: prev event  "
             f"d: next event  "
-            f"w: \u03c3+0.5  "
-            f"s: \u03c3-0.5  "
+            f"w: \u03c3+1  "
+            f"s: \u03c3-1  "
             f"(\u03c3={sigma_val:g})"
             f"{_RESET}"
         )
@@ -691,9 +693,9 @@ def main() -> None:
                         else:
                             view_idx += 1
                     elif key == "w":
-                        _reprocess_sigma(round(sigma + 0.5, 10))
+                        _reprocess_sigma(round(sigma + 1.0, 10))
                     elif key == "s":
-                        _reprocess_sigma(max(2.0, round(sigma - 0.5, 10)))
+                        _reprocess_sigma(max(2.0, round(sigma - 1.0, 10)))
                     else:
                         key_redraw = False
 
