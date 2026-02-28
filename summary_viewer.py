@@ -57,6 +57,19 @@ _COLUMNS = [
 # Index of the error_rate_pct column (used for colouring).
 _ERR_RATE_IDX = next(i for i, (_, f, _) in enumerate(_COLUMNS) if f == "error_rate_pct")
 
+# Fields that should always be rendered with exactly 3 decimal places so the
+# column width stays stable as values change (e.g. "123.5" → "123.500").
+_MS_FIELDS = {"avg_response_time_ms", "min_response_time_ms", "max_response_time_ms"}
+
+
+def _fmt_value(field: str, raw: str) -> str:
+    if field in _MS_FIELDS and raw:
+        try:
+            return f"{float(raw):.3f}"
+        except ValueError:
+            pass
+    return raw
+
 
 def _col_widths(rows: list[dict]) -> list[int]:
     widths = [len(hdr) for hdr, _, _ in _COLUMNS]
@@ -95,7 +108,7 @@ def render(rows: list[dict], path: str, mtime: float) -> str:
     ]
 
     for row in rows:
-        values = [str(row.get(field, "")) for _, field, _ in _COLUMNS]
+        values = [_fmt_value(field, str(row.get(field, ""))) for _, field, _ in _COLUMNS]
         try:
             rate = float(row.get("error_rate_pct", 0))
         except ValueError:
