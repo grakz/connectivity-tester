@@ -127,6 +127,8 @@ def main() -> None:
     args = parser.parse_args()
 
     last_mtime: float | None = None
+    last_rows: list[dict] = []
+    last_display_mtime: float | None = None
 
     try:
         while True:
@@ -150,21 +152,30 @@ def main() -> None:
                 time.sleep(args.interval)
                 continue
 
-            last_mtime = mtime
-
-            # --- read and render ---
+            # --- file has changed: try to read it ---
             try:
                 with open(args.file, newline="") as f:
                     rows = list(csv.DictReader(f))
-            except Exception as exc:
-                sys.stdout.write(_CLEAR)
-                sys.stdout.write(f"Error reading {args.file}: {exc}\n")
-                sys.stdout.flush()
+            except Exception:
+                # Mid-write read error — don't advance last_mtime so we retry
+                # next cycle once the file is fully written.
                 time.sleep(args.interval)
                 continue
 
+            if not rows and last_rows:
+                # File is empty mid-write (truncated but not yet refilled) and
+                # we already have good data — skip this cycle without flickering.
+                time.sleep(args.interval)
+                continue
+
+            # --- good read: update state and redraw ---
+            last_mtime = mtime
+            if rows:
+                last_rows = rows
+                last_display_mtime = mtime
+
             sys.stdout.write(_CLEAR)
-            sys.stdout.write(render(rows, args.file, mtime) + "\n")
+            sys.stdout.write(render(last_rows, args.file, last_display_mtime or mtime) + "\n")
             sys.stdout.flush()
 
             time.sleep(args.interval)
