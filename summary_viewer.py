@@ -147,16 +147,16 @@ def _parse_target_types(fieldnames: list[str]) -> list[tuple[str, str]]:
     return result
 
 
-def _process_results(rows: list[dict]) -> dict:
+def _process_results(rows: list[dict], sigma: float = 2.0) -> dict:
     """Analyse results.csv rows: compute per-target stats and find the last
     timing event.
 
     An event is any slot where a target either failed outright or had a
-    response time exceeding mean + 2·stdev (computed over all successful
+    response time exceeding mean + sigma·stdev (computed over all successful
     measurements).  Event detection is only active after 100 slots.
     """
     if not rows:
-        return {"has_stats": False, "target_types": [], "total_slots": 0}
+        return {"has_stats": False, "target_types": [], "total_slots": 0, "sigma": sigma}
 
     fieldnames = list(rows[0].keys())
     target_types = _parse_target_types(fieldnames)
@@ -193,7 +193,7 @@ def _process_results(rows: list[dict]) -> dict:
                 mean = statistics.mean(vals)
                 stdev = statistics.stdev(vals)
                 means[tt] = mean
-                thresholds[tt] = mean + 2 * stdev
+                thresholds[tt] = mean + sigma * stdev
 
     # Scan slots in order to find the last event slot.
     last_event_slot: int | None = None
@@ -225,6 +225,7 @@ def _process_results(rows: list[dict]) -> dict:
         "has_stats":        has_stats,
         "target_types":     target_types,
         "total_slots":      total_slots,
+        "sigma":            sigma,
         "thresholds":       thresholds,
         "means":            means,
         "last_event_slot":  last_event_slot,
@@ -234,16 +235,23 @@ def _process_results(rows: list[dict]) -> dict:
     }
 
 
-def render_event_table(data: dict) -> str:
-    """Render the timing-event context table below the summary."""
-    if not data:
+def render_event_table(current: dict, event: dict) -> str:
+    """Render the timing-event context table below the summary.
+
+    ``current`` carries the latest analysis stats (has_stats, total_slots,
+    sigma).  ``event`` is the high-water-mark event context — it only ever
+    advances to a later slot, so a partial mid-write read of results.csv
+    cannot cause the display to jump back to an earlier event.
+    """
+    if not current:
         return (
             f"{_BOLD}Timing events:{_RESET}\n"
             f"  {_DIM}(results.csv not available yet){_RESET}"
         )
 
-    total_slots = data.get("total_slots", 0)
-    if not data.get("has_stats"):
+    total_slots = current.get("total_slots", 0)
+    sigma       = current.get("sigma", 2.0)
+    if not current.get("has_stats"):
         needed = 100 - total_slots
         return (
             f"{_BOLD}Timing events:{_RESET}\n"
@@ -251,18 +259,19 @@ def render_event_table(data: dict) -> str:
             f"({needed} more needed){_RESET}"
         )
 
-    last_event_slot = data["last_event_slot"]
+    last_event_slot = event.get("last_event_slot")
     if last_event_slot is None:
         return (
             f"{_BOLD}Timing events:{_RESET}\n"
-            f"  {_DIM}No events detected (threshold: mean + 2·stdev per target){_RESET}"
+            f"  {_DIM}No events detected "
+            f"(threshold: mean + {sigma:g}·stdev per target){_RESET}"
         )
 
-    target_types   = data["target_types"]
-    rows_by_slot   = data["rows_by_slot"]
-    sorted_slots   = data["sorted_slots"]
-    event_triggers = data["event_triggers"]
-    thresholds     = data["thresholds"]
+    target_types   = event["target_types"]
+    rows_by_slot   = event["rows_by_slot"]
+    sorted_slots   = event["sorted_slots"]
+    event_triggers = event["event_triggers"]
+    thresholds     = event["thresholds"]
 
     # Find the ±2 row context window around the event slot.
     event_idx    = sorted_slots.index(last_event_slot)
@@ -373,6 +382,10 @@ def main() -> None:
         help="Path to the results CSV file for event detection (default: results.csv)",
     )
     parser.add_argument(
+        "--sigma", type=float, default=2.0, metavar="N",
+        help="Standard deviations above mean to flag as a timing event (default: 2.0)",
+    )
+    parser.add_argument(
         "--interval", type=float, default=0.5, metavar="SECS",
         help="How often to check for file changes in seconds (default: 0.5)",
     )
@@ -386,6 +399,10 @@ def main() -> None:
     # Results state
     last_results_mtime: float | None = None
     last_results_data:  dict         = {}
+    # High-water-mark event cache: only ever moves to a later event slot so
+    # that a partial mid-write read of results.csv cannot cause the displayed
+    # event to jump back to an earlier one.
+    event_cache:        dict         = {}
 
     try:
         while True:
@@ -444,7 +461,17 @@ def main() -> None:
                     else:
                         last_results_mtime = r_mtime
                         if r_rows:
-                            last_results_data = _process_results(r_rows)
+                            new_data          = _process_results(r_rows, args.sigma)
+                            last_results_data = new_data
+                            # Advance event_cache only when the detected event
+                            # slot is at least as recent as the one we already
+                            # have — never let a partial read push us backward.
+                            new_slot = new_data.get("last_event_slot")
+                            old_slot = event_cache.get("last_event_slot")
+                            if new_slot is not None and (
+                                old_slot is None or new_slot >= old_slot
+                            ):
+                                event_cache = new_data
                         need_redraw = True
 
             # ── redraw ────────────────────────────────────────────────────
@@ -452,7 +479,7 @@ def main() -> None:
                 out  = render(last_summary_rows, args.file,
                               last_summary_display_mtime or s_mtime)
                 out += "\n\n"
-                out += render_event_table(last_results_data)
+                out += render_event_table(last_results_data, event_cache)
                 sys.stdout.write(_CLEAR)
                 sys.stdout.write(out + "\n")
                 sys.stdout.flush()
