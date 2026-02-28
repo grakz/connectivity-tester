@@ -446,7 +446,6 @@ def main() -> None:
     # mid-write read from reverting has_stats to False or losing recent events.
     last_results_mtime: float | None = None
     last_results_data:  dict         = {}
-    last_r_rows:        list[dict]   = []   # kept for sigma-change reprocessing
 
     # Navigation state: None = auto-follow latest, int = pinned index.
     view_idx: int | None = None
@@ -493,12 +492,15 @@ def main() -> None:
         sys.stdout.flush()
 
     def _reprocess_sigma(new_sigma: float) -> None:
-        """Reprocess last_r_rows with the new sigma and update all state."""
+        """Reprocess results with the new sigma and update all state."""
         nonlocal sigma, last_results_data, view_idx
         sigma = new_sigma
-        if not last_r_rows:
+        rows_by_slot = last_results_data.get("rows_by_slot", {})
+        if not rows_by_slot:
             return
-        new_data = _process_results(last_r_rows, sigma, args.no_ping_events)
+        # Reconstruct the ordered row list from the already-held index.
+        rows = [rows_by_slot[s] for s in last_results_data["sorted_slots"]]
+        new_data = _process_results(rows, sigma, args.no_ping_events)
         last_results_data = new_data
         # Clamp view_idx if events list shrank.
         n = len(new_data.get("events", []))
@@ -578,7 +580,6 @@ def main() -> None:
                             old_total = last_results_data.get("total_slots", 0)
                             if new_data["total_slots"] >= old_total:
                                 last_results_data = new_data
-                                last_r_rows       = r_rows
                         need_redraw = True
 
             # ── redraw from file changes ───────────────────────────────────
