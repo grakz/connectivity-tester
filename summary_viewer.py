@@ -7,10 +7,18 @@ terminal while dns_poller.py is running:
     python3 summary_viewer.py                        # watch ./summary.csv
     python3 summary_viewer.py --file /tmp/summary.csv
     python3 summary_viewer.py --interval 1           # check every 1 s
+    python3 summary_viewer.py --sigma 3              # spike = mean + 3·stdev
+    python3 summary_viewer.py --no-ping-events       # only dns/http trigger events
 
-After 100 iterations the viewer also reads results.csv and shows a timing-
-event table: the ±2-row context window around the most recent slot where any
-target failed outright or exceeded mean + 2·stdev response time.
+After 100 iterations the viewer reads results.csv and shows a timing-event
+table.  The baseline (mean + stdev) is computed once from the first 100 slots
+with outlier removal, so the event threshold stays fixed for the whole run.
+
+Keyboard shortcuts (shown in the on-screen tooltip):
+    a   previous timing event
+    d   next timing event
+    w   increase sigma by 0.5  (min 2.0)
+    s   decrease sigma by 0.5  (min 2.0)
 """
 
 import argparse
@@ -21,6 +29,15 @@ import statistics
 import sys
 import time
 from datetime import datetime
+
+# Optional keyboard support (Unix only)
+try:
+    import select
+    import termios
+    import tty
+    _KEYBOARD = sys.stdin.isatty()
+except ImportError:
+    _KEYBOARD = False
 
 # ---------------------------------------------------------------------------
 # ANSI helpers
@@ -60,12 +77,8 @@ _COLUMNS = [
     ("max ms",     "max_response_time_ms", True),
 ]
 
-# Index of the error_rate_pct column (used for colouring).
 _ERR_RATE_IDX = next(i for i, (_, f, _) in enumerate(_COLUMNS) if f == "error_rate_pct")
-
-# Fields that should always be rendered with exactly 3 decimal places so the
-# column width stays stable as values change (e.g. "123.5" → "123.500").
-_MS_FIELDS = {"avg_response_time_ms", "min_response_time_ms", "max_response_time_ms"}
+_MS_FIELDS    = {"avg_response_time_ms", "min_response_time_ms", "max_response_time_ms"}
 
 
 def _fmt_value(field: str, raw: str) -> str:
@@ -81,7 +94,6 @@ def _col_widths(rows: list[dict]) -> list[int]:
     widths = [len(hdr) for hdr, _, _ in _COLUMNS]
     for row in rows:
         for i, (_, field, _) in enumerate(_COLUMNS):
-            # Use the formatted value so widths account for 3-decimal expansion.
             widths[i] = max(widths[i], len(_fmt_value(field, str(row.get(field, "")))))
     return widths
 
@@ -129,16 +141,11 @@ def render(rows: list[dict], path: str, mtime: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Results analysis — stddev, event detection, event table
+# Results analysis — frozen baseline, event detection, event table
 # ---------------------------------------------------------------------------
 
 def _parse_target_types(fieldnames: list[str]) -> list[tuple[str, str]]:
-    """Return (target, type) pairs inferred from results.csv column names.
-
-    Column names follow the pattern <target>_(dns|http|ping)_<field>.
-    We anchor on the *_success suffix to identify target+type pairs; the
-    greedy regex correctly handles targets that themselves contain underscores.
-    """
+    """Return (target, type) pairs inferred from results.csv column names."""
     result = []
     for col in fieldnames:
         m = re.match(r"^(.+)_(dns|http|ping)_success$", col)
@@ -147,68 +154,85 @@ def _parse_target_types(fieldnames: list[str]) -> list[tuple[str, str]]:
     return result
 
 
-def _process_results(rows: list[dict], sigma: float = 2.0) -> dict:
-    """Analyse results.csv rows: compute per-target stats and find the last
-    timing event.
+def _process_results(rows: list[dict], sigma: float = 2.0,
+                     no_ping_events: bool = False) -> dict:
+    """Analyse results.csv rows: compute a frozen baseline and detect events.
 
-    An event is any slot where a target either failed outright or had a
-    response time exceeding mean + sigma·stdev (computed over all successful
-    measurements).  Event detection is only active after 100 slots.
+    Baseline is computed from the first 100 slots only, with two-pass outlier
+    removal (values beyond sigma·stdev from the initial mean are excluded before
+    the final mean/stdev are calculated).  This keeps the event threshold stable
+    throughout a long run — events cannot appear or disappear as the average
+    shifts over time.
+
+    ``no_ping_events`` prevents ping measurements from triggering events (they
+    are still shown in the event context table).
     """
     if not rows:
-        return {"has_stats": False, "target_types": [], "total_slots": 0, "sigma": sigma}
+        return {
+            "has_stats": False, "target_types": [], "total_slots": 0,
+            "sigma": sigma, "events": [], "rows_by_slot": {}, "sorted_slots": [],
+            "thresholds": {},
+        }
 
-    fieldnames = list(rows[0].keys())
+    fieldnames   = list(rows[0].keys())
     target_types = _parse_target_types(fieldnames)
 
-    # Index rows by slot; collect successful response times per target+type.
+    # Index all rows by slot number.
     rows_by_slot: dict[int, dict] = {}
-    rt_values: dict[tuple, list[float]] = {tt: [] for tt in target_types}
-
     for row in rows:
         try:
             slot = int(row["slot"])
         except (KeyError, ValueError):
             continue
         rows_by_slot[slot] = row
-        for tt in target_types:
-            target, type_ = tt
-            if row.get(f"{target}_{type_}_success") == "True":
-                rt_str = row.get(f"{target}_{type_}_response_time_ms", "")
-                try:
-                    rt_values[tt].append(float(rt_str))
-                except ValueError:
-                    pass
 
     sorted_slots = sorted(rows_by_slot)
     total_slots  = len(sorted_slots)
     has_stats    = total_slots >= 100
 
-    # Compute mean, stdev, and spike threshold for each target+type.
+    # ── Frozen baseline from the first 100 slots ────────────────────────────
+    # Two-pass: compute initial mean/stdev, remove outliers, recompute.
     thresholds: dict[tuple, float] = {}
-    means: dict[tuple, float] = {}
     if has_stats:
-        for tt, vals in rt_values.items():
-            if len(vals) >= 2:
-                mean = statistics.mean(vals)
-                stdev = statistics.stdev(vals)
-                means[tt] = mean
-                thresholds[tt] = mean + sigma * stdev
+        baseline_slots = sorted_slots[:100]
+        for tt in target_types:
+            target, type_ = tt
+            vals: list[float] = []
+            for slot in baseline_slots:
+                r = rows_by_slot[slot]
+                if r.get(f"{target}_{type_}_success") == "True":
+                    rt_str = r.get(f"{target}_{type_}_response_time_ms", "")
+                    try:
+                        vals.append(float(rt_str))
+                    except ValueError:
+                        pass
+            if len(vals) < 2:
+                continue
+            m1 = statistics.mean(vals)
+            s1 = statistics.stdev(vals)
+            # Remove outliers beyond sigma·stdev and recompute.
+            clean = [v for v in vals if abs(v - m1) <= sigma * s1]
+            if len(clean) >= 2:
+                m2 = statistics.mean(clean)
+                s2 = statistics.stdev(clean)
+            else:
+                m2, s2 = m1, s1
+            thresholds[tt] = m2 + sigma * s2
 
-    # Scan slots in order to find the last event slot.
-    last_event_slot: int | None = None
-    event_triggers: set[tuple] = set()
-
+    # ── Scan all slots to build the ordered list of timing events ───────────
+    events: list[dict] = []
     if has_stats:
         for slot in sorted_slots:
-            row = rows_by_slot[slot]
+            row      = rows_by_slot[slot]
             triggers: set[tuple] = set()
             for tt in target_types:
                 target, type_ = tt
+                if no_ping_events and type_ == "ping":
+                    continue  # excluded from event triggering
                 success = row.get(f"{target}_{type_}_success", "")
                 if not success:
-                    continue  # no measurement for this target in this slot
-                rt_str = row.get(f"{target}_{type_}_response_time_ms", "")
+                    continue  # target not measured in this slot
+                rt_str   = row.get(f"{target}_{type_}_response_time_ms", "")
                 is_event = (success == "False")
                 if not is_event and tt in thresholds and rt_str:
                     try:
@@ -218,40 +242,37 @@ def _process_results(rows: list[dict], sigma: float = 2.0) -> dict:
                 if is_event:
                     triggers.add(tt)
             if triggers:
-                last_event_slot = slot
-                event_triggers  = triggers
+                events.append({"slot": slot, "triggers": frozenset(triggers)})
 
     return {
-        "has_stats":        has_stats,
-        "target_types":     target_types,
-        "total_slots":      total_slots,
-        "sigma":            sigma,
-        "thresholds":       thresholds,
-        "means":            means,
-        "last_event_slot":  last_event_slot,
-        "event_triggers":   event_triggers,
-        "rows_by_slot":     rows_by_slot,
-        "sorted_slots":     sorted_slots,
+        "has_stats":    has_stats,
+        "target_types": target_types,
+        "total_slots":  total_slots,
+        "sigma":        sigma,
+        "thresholds":   thresholds,
+        "events":       events,
+        "rows_by_slot": rows_by_slot,
+        "sorted_slots": sorted_slots,
     }
 
 
-def render_event_table(current: dict, event: dict) -> str:
-    """Render the timing-event context table below the summary.
+def render_event_table(data: dict, view_idx: int | None) -> str:
+    """Render the timing-event context table.
 
-    ``current`` carries the latest analysis stats (has_stats, total_slots,
-    sigma).  ``event`` is the high-water-mark event context — it only ever
-    advances to a later slot, so a partial mid-write read of results.csv
-    cannot cause the display to jump back to an earlier event.
+    ``data`` is the high-water-mark processed results (never regresses).
+    ``view_idx`` is None for auto-follow-latest or an int index into the events
+    list for pinned navigation.
     """
-    if not current:
+    if not data:
         return (
             f"{_BOLD}Timing events:{_RESET}\n"
             f"  {_DIM}(results.csv not available yet){_RESET}"
         )
 
-    total_slots = current.get("total_slots", 0)
-    sigma       = current.get("sigma", 2.0)
-    if not current.get("has_stats"):
+    total_slots = data.get("total_slots", 0)
+    sigma       = data.get("sigma", 2.0)
+
+    if not data.get("has_stats"):
         needed = 100 - total_slots
         return (
             f"{_BOLD}Timing events:{_RESET}\n"
@@ -259,30 +280,37 @@ def render_event_table(current: dict, event: dict) -> str:
             f"({needed} more needed){_RESET}"
         )
 
-    last_event_slot = event.get("last_event_slot")
-    if last_event_slot is None:
+    events = data.get("events", [])
+    total_events = len(events)
+
+    if total_events == 0:
         return (
             f"{_BOLD}Timing events:{_RESET}\n"
             f"  {_DIM}No events detected "
-            f"(threshold: mean + {sigma:g}·stdev per target){_RESET}"
+            f"(threshold: mean\u202f+\u202f{sigma:g}\u00b7stdev, frozen from first 100 iterations){_RESET}"
         )
 
-    target_types   = event["target_types"]
-    rows_by_slot   = event["rows_by_slot"]
-    sorted_slots   = event["sorted_slots"]
-    event_triggers = event["event_triggers"]
-    thresholds     = event["thresholds"]
+    # Resolve which event to display.
+    if view_idx is None:
+        actual_idx = total_events - 1   # auto-follow latest
+    else:
+        actual_idx = max(0, min(view_idx, total_events - 1))
 
-    # Find the ±2 row context window around the event slot.
-    event_idx    = sorted_slots.index(last_event_slot)
-    context_slots = [
-        sorted_slots[event_idx + offset]
-        if 0 <= event_idx + offset < len(sorted_slots) else None
-        for offset in (-2, -1, 0, 1, 2)
-    ]
+    ev              = events[actual_idx]
+    event_slot      = ev["slot"]
+    event_triggers  = ev["triggers"]
+    target_types    = data["target_types"]
+    rows_by_slot    = data["rows_by_slot"]
+    sorted_slots    = data["sorted_slots"]
+    thresholds      = data["thresholds"]
 
-    # Pull the event timestamp from the first available target in that slot.
-    event_row = rows_by_slot[last_event_slot]
+    # ── Navigation header ───────────────────────────────────────────────────
+    nav_label = f"event {actual_idx + 1} of {total_events}"
+    if view_idx is None:
+        nav_label += "  (latest)"
+
+    # ── Event timestamp ─────────────────────────────────────────────────────
+    event_row = rows_by_slot[event_slot]
     event_ts  = ""
     for target, type_ in target_types:
         ts = event_row.get(f"{target}_{type_}_timestamp", "")
@@ -290,10 +318,21 @@ def render_event_table(current: dict, event: dict) -> str:
             event_ts = ts[:19].replace("T", " ")
             break
 
-    # Build per-row display values and cell classifications.
+    # ── Context window: ±2 rows in the data around the event slot ───────────
+    try:
+        event_pos = sorted_slots.index(event_slot)
+    except ValueError:
+        event_pos = 0
+    context_slots = [
+        sorted_slots[event_pos + offset]
+        if 0 <= event_pos + offset < len(sorted_slots) else None
+        for offset in (-2, -1, 0, 1, 2)
+    ]
+
+    # ── Build per-row display values ────────────────────────────────────────
     # Layout: [target, type, t-2, t-1, t, t+1, t+2]
     # Cell kinds: "normal" | "spike" | "fail" | "missing"
-    _EVENT_COL = 4   # index of the "t" column in the row
+    _EVENT_COL = 4
 
     table_rows: list[tuple[tuple, list[str], list[str]]] = []
     for tt in target_types:
@@ -321,21 +360,19 @@ def render_event_table(current: dict, event: dict) -> str:
                 display.append("—"); kinds.append("missing")
         table_rows.append((tt, display, kinds))
 
-    # Column headers; "t" is bold to mark the event column.
+    # ── Column headers ───────────────────────────────────────────────────────
     col_labels = ["t-2", "t-1", "t", "t+1", "t+2"]
     headers    = ["target", "type"] + col_labels
 
-    # Compute column widths from display values.
     widths = [len(h) for h in headers]
     for _, display, _ in table_rows:
         for i, v in enumerate(display):
             widths[i] = max(widths[i], len(v))
 
-    RIGHT_COLS = set(range(2, 7))  # ms columns are right-aligned
+    RIGHT_COLS = set(range(2, 7))
 
     def _hdr_cell(label: str, idx: int) -> str:
         aligned = label.rjust(widths[idx]) if idx in RIGHT_COLS else label.ljust(widths[idx])
-        # Event column: bold + yellow; all other headers: just bold.
         if idx == _EVENT_COL:
             return _BOLD + _YELLOW + aligned + _RESET
         return _BOLD + aligned + _RESET
@@ -352,10 +389,10 @@ def render_event_table(current: dict, event: dict) -> str:
     header = "  ".join(_hdr_cell(h, i) for i, h in enumerate(headers))
 
     lines = [
-        f"{_BOLD}Last timing event:{_RESET}  "
-        f"slot {last_event_slot}  {_DIM}{event_ts}{_RESET}",
+        f"{_BOLD}Timing event  {nav_label}:{_RESET}  "
+        f"slot {event_slot}  {_DIM}{event_ts}{_RESET}",
         "",
-        f"  {header}",   # each cell already carries its own bold/colour
+        f"  {header}",
         f"  {sep}",
     ]
     for _, display, kinds in table_rows:
@@ -386,27 +423,92 @@ def main() -> None:
         help="Standard deviations above mean to flag as a timing event (default: 2.0)",
     )
     parser.add_argument(
+        "--no-ping-events", action="store_true",
+        help="Exclude ping results from triggering timing events",
+    )
+    parser.add_argument(
         "--interval", type=float, default=0.5, metavar="SECS",
         help="How often to check for file changes in seconds (default: 0.5)",
     )
     args = parser.parse_args()
 
-    # Summary state
-    last_summary_mtime:        float | None = None
-    last_summary_rows:         list[dict]   = []
+    # Runtime-adjustable sigma (keyboard w/s).
+    sigma = max(2.0, args.sigma)
+
+    # Summary state.
+    last_summary_mtime:         float | None = None
+    last_summary_rows:          list[dict]   = []
     last_summary_display_mtime: float | None = None
 
-    # Results state
+    # Results state.
+    # last_results_data is the high-water-mark: only updated when the new read
+    # has at least as many slots as the current best.  This prevents a partial
+    # mid-write read from reverting has_stats to False or losing recent events.
     last_results_mtime: float | None = None
     last_results_data:  dict         = {}
-    # High-water-mark event cache: only ever moves to a later event slot so
-    # that a partial mid-write read of results.csv cannot cause the displayed
-    # event to jump back to an earlier one.
-    event_cache:        dict         = {}
+    last_r_rows:        list[dict]   = []   # kept for sigma-change reprocessing
+
+    # Navigation state: None = auto-follow latest, int = pinned index.
+    view_idx: int | None = None
+
+    # ── Terminal setup ───────────────────────────────────────────────────────
+    kb = _KEYBOARD
+    fd: int = -1
+    old_term = None
+    if kb:
+        try:
+            fd       = sys.stdin.fileno()
+            old_term = termios.tcgetattr(fd)
+            tty.cbreak(fd)
+        except Exception:
+            kb = False
+
+    def _do_redraw(s_mtime: float) -> None:
+        """Clear screen and write the full combined display."""
+        out  = render(last_summary_rows, args.file,
+                      last_summary_display_mtime or s_mtime)
+        out += "\n\n"
+        out += render_event_table(last_results_data, view_idx)
+
+        # Tooltip anchored to the bottom of the terminal.
+        sigma_val = last_results_data.get("sigma", sigma)
+        tip = (
+            f"  {_DIM}a: prev event  "
+            f"d: next event  "
+            f"w: \u03c3+0.5  "
+            f"s: \u03c3-0.5  "
+            f"(\u03c3={sigma_val:g})"
+            f"{_RESET}"
+        )
+        if kb:
+            try:
+                rows_t = os.get_terminal_size().lines
+                tip = f"\033[{rows_t};1H{tip}"
+            except OSError:
+                tip = "\n" + tip
+
+        sys.stdout.write(_CLEAR)
+        sys.stdout.write(out + "\n")
+        sys.stdout.write(tip)
+        sys.stdout.flush()
+
+    def _reprocess_sigma(new_sigma: float) -> None:
+        """Reprocess last_r_rows with the new sigma and update all state."""
+        nonlocal sigma, last_results_data, view_idx
+        sigma = new_sigma
+        if not last_r_rows:
+            return
+        new_data = _process_results(last_r_rows, sigma, args.no_ping_events)
+        last_results_data = new_data
+        # Clamp view_idx if events list shrank.
+        n = len(new_data.get("events", []))
+        if view_idx is not None and (n == 0 or view_idx >= n):
+            view_idx = None
 
     try:
         while True:
             need_redraw = False
+            s_mtime     = 0.0
 
             # ── summary.csv ───────────────────────────────────────────────
             try:
@@ -420,7 +522,13 @@ def main() -> None:
                     f"{_DIM}Waiting for file to be created...  Ctrl-C to quit{_RESET}\n"
                 )
                 sys.stdout.flush()
-                time.sleep(args.interval)
+                if kb:
+                    try:
+                        select.select([sys.stdin], [], [], args.interval)
+                    except (ValueError, OSError):
+                        time.sleep(args.interval)
+                else:
+                    time.sleep(args.interval)
                 continue
 
             if s_mtime != last_summary_mtime:
@@ -428,10 +536,10 @@ def main() -> None:
                     with open(args.file, newline="") as f:
                         s_rows = list(csv.DictReader(f))
                 except Exception:
-                    s_rows = None   # mid-write; don't advance mtime
+                    s_rows = None
 
                 if s_rows is None:
-                    pass            # retry next cycle
+                    pass
                 elif not s_rows and last_summary_rows:
                     pass            # mid-write truncation; retry
                 else:
@@ -445,49 +553,93 @@ def main() -> None:
             try:
                 r_mtime = os.stat(args.results).st_mtime
             except FileNotFoundError:
-                pass    # optional; absence is fine before poller starts
+                pass    # not yet created; that's fine
             else:
                 if r_mtime != last_results_mtime:
                     try:
                         with open(args.results, newline="") as f:
                             r_rows = list(csv.DictReader(f))
                     except Exception:
-                        r_rows = None   # mid-write
+                        r_rows = None
 
                     if r_rows is None:
-                        pass            # retry next cycle
+                        pass
                     elif not r_rows and last_results_data:
-                        pass            # mid-write truncation; retry
+                        pass        # mid-write truncation; retry
                     else:
                         last_results_mtime = r_mtime
                         if r_rows:
-                            new_data          = _process_results(r_rows, args.sigma)
-                            last_results_data = new_data
-                            # Advance event_cache only when the detected event
-                            # slot is at least as recent as the one we already
-                            # have — never let a partial read push us backward.
-                            new_slot = new_data.get("last_event_slot")
-                            old_slot = event_cache.get("last_event_slot")
-                            if new_slot is not None and (
-                                old_slot is None or new_slot >= old_slot
-                            ):
-                                event_cache = new_data
+                            new_data = _process_results(
+                                r_rows, sigma, args.no_ping_events)
+                            # Only adopt the new analysis if it has at least as
+                            # many slots as we already know about — prevents a
+                            # partial mid-write read from reverting has_stats or
+                            # losing events that we already displayed.
+                            old_total = last_results_data.get("total_slots", 0)
+                            if new_data["total_slots"] >= old_total:
+                                last_results_data = new_data
+                                last_r_rows       = r_rows
                         need_redraw = True
 
-            # ── redraw ────────────────────────────────────────────────────
+            # ── redraw from file changes ───────────────────────────────────
             if need_redraw:
-                out  = render(last_summary_rows, args.file,
-                              last_summary_display_mtime or s_mtime)
-                out += "\n\n"
-                out += render_event_table(last_results_data, event_cache)
-                sys.stdout.write(_CLEAR)
-                sys.stdout.write(out + "\n")
-                sys.stdout.flush()
+                _do_redraw(s_mtime)
 
-            time.sleep(args.interval)
+            # ── keyboard input (blocks up to args.interval) ───────────────
+            if kb:
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], args.interval)
+                except (ValueError, OSError):
+                    time.sleep(args.interval)
+                    continue
+
+                if ready:
+                    try:
+                        key = sys.stdin.read(1)
+                    except OSError:
+                        key = ""
+
+                    events     = last_results_data.get("events", [])
+                    n_events   = len(events)
+                    key_redraw = True
+
+                    if key == "a":
+                        # Previous event.
+                        if view_idx is None:
+                            view_idx = max(0, n_events - 2)
+                        elif view_idx > 0:
+                            view_idx -= 1
+                        else:
+                            key_redraw = False   # already at first
+                    elif key == "d":
+                        # Next event.
+                        if view_idx is None:
+                            key_redraw = False   # already at latest
+                        elif view_idx >= n_events - 1:
+                            view_idx = None      # snap back to auto-follow
+                        else:
+                            view_idx += 1
+                    elif key == "w":
+                        _reprocess_sigma(round(sigma + 0.5, 10))
+                    elif key == "s":
+                        _reprocess_sigma(max(2.0, round(sigma - 0.5, 10)))
+                    else:
+                        key_redraw = False
+
+                    if key_redraw:
+                        _do_redraw(s_mtime)
+            else:
+                time.sleep(args.interval)
 
     except KeyboardInterrupt:
-        print()   # leave the terminal on a clean line
+        pass
+    finally:
+        if kb and old_term is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
+        print()   # leave terminal on a clean line
 
 
 if __name__ == "__main__":
