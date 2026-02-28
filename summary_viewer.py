@@ -34,7 +34,6 @@ from datetime import datetime
 try:
     import select
     import termios
-    import tty
     _KEYBOARD = sys.stdin.isatty()
 except ImportError:
     _KEYBOARD = False
@@ -171,7 +170,7 @@ def _process_results(rows: list[dict], sigma: float = 2.0,
         return {
             "has_stats": False, "target_types": [], "total_slots": 0,
             "sigma": sigma, "events": [], "rows_by_slot": {}, "sorted_slots": [],
-            "thresholds": {},
+            "thresholds": {}, "baselines": {},
         }
 
     fieldnames   = list(rows[0].keys())
@@ -193,6 +192,7 @@ def _process_results(rows: list[dict], sigma: float = 2.0,
     # ── Frozen baseline from the first 100 slots ────────────────────────────
     # Two-pass: compute initial mean/stdev, remove outliers, recompute.
     thresholds: dict[tuple, float] = {}
+    baselines:  dict[tuple, dict]  = {}   # mean, stdev, threshold — for display
     if has_stats:
         baseline_slots = sorted_slots[:100]
         for tt in target_types:
@@ -217,7 +217,13 @@ def _process_results(rows: list[dict], sigma: float = 2.0,
                 s2 = statistics.stdev(clean)
             else:
                 m2, s2 = m1, s1
-            thresholds[tt] = m2 + sigma * s2
+            threshold       = m2 + sigma * s2
+            thresholds[tt]  = threshold
+            baselines[tt]   = {
+                "mean":      round(m2, 3),
+                "stdev":     round(s2, 3),
+                "threshold": round(threshold, 3),
+            }
 
     # ── Scan all slots to build the ordered list of timing events ───────────
     events: list[dict] = []
@@ -250,10 +256,55 @@ def _process_results(rows: list[dict], sigma: float = 2.0,
         "total_slots":  total_slots,
         "sigma":        sigma,
         "thresholds":   thresholds,
+        "baselines":    baselines,
         "events":       events,
         "rows_by_slot": rows_by_slot,
         "sorted_slots": sorted_slots,
     }
+
+
+def _render_baseline_table(data: dict) -> str:
+    """Render the frozen baseline stats (avg, std, threshold) for every target."""
+    baselines = data.get("baselines", {})
+    sigma     = data.get("sigma", 2.0)
+    if not baselines:
+        return ""
+
+    headers = ["target", "type", "avg ms", "std ms", f"avg + {sigma:g}·std  (threshold)"]
+    rows = [
+        [target, type_,
+         f"{b['mean']:.3f}", f"{b['stdev']:.3f}", f"{b['threshold']:.3f}"]
+        for (target, type_), b in baselines.items()
+    ]
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, v in enumerate(row):
+            widths[i] = max(widths[i], len(v))
+
+    RIGHT = set(range(2, len(headers)))
+
+    def _hdr(label: str, idx: int) -> str:
+        aligned = label.rjust(widths[idx]) if idx in RIGHT else label.ljust(widths[idx])
+        return _BOLD + aligned + _RESET
+
+    def _cell(val: str, idx: int) -> str:
+        aligned = val.rjust(widths[idx]) if idx in RIGHT else val.ljust(widths[idx])
+        if idx == len(headers) - 1:          # threshold column — highlight
+            return _YELLOW + _BOLD + aligned + _RESET
+        return aligned
+
+    sep    = "  ".join("─" * w for w in widths)
+    header = "  ".join(_hdr(h, i) for i, h in enumerate(headers))
+    lines  = [
+        f"{_BOLD}Baseline{_RESET}  "
+        f"{_DIM}(frozen from first 100 iterations, \u03c3={sigma:g}){_RESET}",
+        f"  {header}",
+        f"  {sep}",
+    ]
+    for row in rows:
+        lines.append("  " + "  ".join(_cell(v, i) for i, v in enumerate(row)))
+    return "\n".join(lines)
 
 
 def render_event_table(data: dict, view_idx: int | None) -> str:
@@ -284,11 +335,12 @@ def render_event_table(data: dict, view_idx: int | None) -> str:
     total_events = len(events)
 
     if total_events == 0:
-        return (
+        baseline_section = _render_baseline_table(data)
+        no_events_msg = (
             f"{_BOLD}Timing events:{_RESET}\n"
-            f"  {_DIM}No events detected "
-            f"(threshold: mean\u202f+\u202f{sigma:g}\u00b7stdev, frozen from first 100 iterations){_RESET}"
+            f"  {_DIM}No events detected{_RESET}"
         )
+        return no_events_msg + ("\n\n" + baseline_section if baseline_section else "")
 
     # Resolve which event to display.
     if view_idx is None:
@@ -399,6 +451,11 @@ def render_event_table(data: dict, view_idx: int | None) -> str:
         cells = [_data_cell(display[i], kinds[i], i) for i in range(len(headers))]
         lines.append("  " + "  ".join(cells))
 
+    baseline_section = _render_baseline_table(data)
+    if baseline_section:
+        lines.append("")
+        lines.append(baseline_section)
+
     return "\n".join(lines)
 
 
@@ -458,7 +515,17 @@ def main() -> None:
         try:
             fd       = sys.stdin.fileno()
             old_term = termios.tcgetattr(fd)
-            tty.cbreak(fd)
+            # Explicitly disable canonical mode AND echo.
+            # tty.cbreak() does not clear ECHO in Python < 3.12, which causes
+            # pressed keys to appear on screen and, more importantly, to be
+            # delivered via the line-buffered TextIOWrapper rather than the raw
+            # fd — making sys.stdin.read(1) unreliable after select().
+            new_term    = list(old_term)
+            new_term[3] = new_term[3] & ~(termios.ICANON | termios.ECHO)
+            new_term[6] = list(old_term[6])          # deep-copy cc array
+            new_term[6][termios.VMIN]  = 1           # return after 1 byte
+            new_term[6][termios.VTIME] = 0           # no timeout
+            termios.tcsetattr(fd, termios.TCSADRAIN, new_term)
         except Exception:
             kb = False
 
@@ -596,7 +663,10 @@ def main() -> None:
 
                 if ready:
                     try:
-                        key = sys.stdin.read(1)
+                        # Read directly from the raw fd — bypasses
+                        # TextIOWrapper buffering which can stall after select().
+                        raw = os.read(fd, 1)
+                        key = raw.decode("utf-8", errors="ignore") if raw else ""
                     except OSError:
                         key = ""
 
