@@ -32,6 +32,17 @@ from icmplib import SocketPermissionError
 # Use raw ICMP sockets when running as root, UDP otherwise (no root needed).
 _PRIVILEGED = os.geteuid() == 0
 
+# Lock so concurrent threads don't interleave their console output.
+_print_lock = threading.Lock()
+_quiet = False
+
+
+def _print(*args, **kwargs) -> None:
+    if _quiet:
+        return
+    with _print_lock:
+        print(*args, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Summary tracking
@@ -527,7 +538,14 @@ def main() -> None:
         "--config", default="config.json", metavar="FILE",
         help="Path to JSON config file (default: config.json)",
     )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Suppress all output to stdout.",
+    )
     args = parser.parse_args()
+
+    global _quiet
+    _quiet = args.quiet
 
     config = load_config(args.config)
     interval: float = config["interval"]
@@ -544,18 +562,18 @@ def main() -> None:
     ping_hosts: list[str] = config.get("ping_hosts", [])
     http_check: bool = bool(config.get("http_check", False))
 
-    print(f"Config     : {args.config}")
-    print(f"Interval   : {interval}s  |  Iterations: {iterations}  |  Timeout: {timeout}s")
+    _print(f"Config     : {args.config}")
+    _print(f"Interval   : {interval}s  |  Iterations: {iterations}  |  Timeout: {timeout}s")
     if domains:
-        print(f"DNS domains: {', '.join(domains)}"
-              + ("  (+HTTP check)" if http_check else ""))
+        _print(f"DNS domains: {', '.join(domains)}"
+               + ("  (+HTTP check)" if http_check else ""))
         if "dns_server" in config:
-            print(f"DNS server : {config['dns_server']}")
+            _print(f"DNS server : {config['dns_server']}")
     if ping_hosts:
-        print(f"Ping hosts : {', '.join(ping_hosts)}")
-    print(f"Results    : results.csv")
-    print(f"Summary    : summary.csv")
-    print()
+        _print(f"Ping hosts : {', '.join(ping_hosts)}")
+    _print(f"Results    : results.csv")
+    _print(f"Summary    : summary.csv")
+    _print()
 
     resolver = build_resolver(config) if domains else None
 
@@ -600,8 +618,8 @@ def main() -> None:
 
     results_writer.finalize()
 
-    print(f"\n  -> results.csv written ({iterations} slots)")
-    print(f"  -> summary.csv written")
+    _print(f"\n  -> results.csv written ({iterations} slots)")
+    _print(f"  -> summary.csv written")
 
 
 if __name__ == "__main__":
