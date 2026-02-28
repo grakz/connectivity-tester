@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from datetime import datetime
 
 import dns.resolver
@@ -168,6 +169,13 @@ class SummaryTracker:
 # DNS
 # ---------------------------------------------------------------------------
 
+def _hostname(entry: str) -> str:
+    """Return just the hostname from a plain domain name or a full URL."""
+    if "://" in entry:
+        return urlparse(entry).hostname or entry
+    return entry
+
+
 def reverse_lookup(ip: str) -> str:
     """Return the PTR hostname for an IP, or the IP itself if lookup fails."""
     try:
@@ -205,13 +213,20 @@ def dns_lookup(domain: str, resolver: dns.resolver.Resolver) -> dict:
 
 
 def http_get(domain: str, timeout: float) -> dict:
-    """Perform an HTTPS GET to *domain* and return timing + status information.
+    """Perform an HTTP(S) GET and return timing + status information.
 
-    Falls back to plain HTTP if the HTTPS attempt raises an SSL or connection
-    error (not an HTTP-level error such as 4xx/5xx).
+    If *domain* is already a full URL it is used as-is with no scheme fallback.
+    Otherwise tries https://<domain> first, then falls back to http:// on SSL
+    or connection failures (not on HTTP-level errors such as 4xx/5xx).
     """
-    for scheme in ("https", "http"):
-        url = f"{scheme}://{domain}"
+    if "://" in domain:
+        attempts = [(None, domain)]          # explicit URL — no fallback
+    else:
+        attempts = [("https", f"https://{domain}"), ("http", f"http://{domain}")]
+
+    last_error = ""
+    last_elapsed = 0.0
+    for scheme, url in attempts:
         start = time.perf_counter()
         try:
             req = urllib.request.Request(url, method="GET",
@@ -237,7 +252,8 @@ def http_get(domain: str, timeout: float) -> dict:
             elapsed_ms = (time.perf_counter() - start) * 1000
             last_error = str(exc)
             last_elapsed = elapsed_ms
-            # Only fall through to http:// on SSL / connection failures.
+            # Only fall through to http:// on SSL / connection failures,
+            # and only when we constructed the URL ourselves (not user-supplied).
             if scheme == "https" and any(
                 kw in type(exc).__name__ for kw in ("SSL", "Certificate", "timeout")
             ):
@@ -261,7 +277,11 @@ def poll_dns(domain: str, interval: float, iterations: int,
              writer: ResultsWriter, resolver: dns.resolver.Resolver,
              http_check: bool = False, timeout: float = 5.0,
              summary: SummaryTracker | None = None,
-             schedule_start: float | None = None) -> None:
+             schedule_start: float | None = None,
+             http_url: str | None = None) -> None:
+    # domain is always the plain hostname; http_url (if set) is the full URL
+    # to fetch, preserving any path the user specified in the config.
+    http_target = http_url or domain
     pad = len(str(iterations))
     t0 = schedule_start if schedule_start is not None else time.monotonic()
 
@@ -291,7 +311,7 @@ def poll_dns(domain: str, interval: float, iterations: int,
         http_result: dict = {}
         if http_check:
             http_timestamp = datetime.now().isoformat()
-            http_result = http_get(domain, timeout)
+            http_result = http_get(http_target, timeout)
             if summary:
                 summary.update(domain, "http", http_result["http_success"],
                                http_result["http_response_time_ms"])
@@ -480,7 +500,14 @@ def main() -> None:
     interval: float = config["interval"]
     iterations: int = config["iterations"]
     timeout: float = config.get("timeout", 5.0)
-    domains: list[str] = config.get("domains", [])
+    # Normalize domain entries: extract hostname from any full URL so that DNS
+    # resolution always gets a plain hostname.  The original URL (if given) is
+    # preserved in http_url_map so the HTTP check still fetches the full path.
+    raw_domains: list[str] = config.get("domains", [])
+    domains: list[str] = [_hostname(d) for d in raw_domains]
+    http_url_map: dict[str, str] = {
+        _hostname(d): d for d in raw_domains if "://" in d
+    }
     ping_hosts: list[str] = config.get("ping_hosts", [])
     http_check: bool = bool(config.get("http_check", False))
 
@@ -533,7 +560,8 @@ def main() -> None:
         t = threading.Thread(
             target=poll_dns,
             args=(domain, interval, iterations, results_writer, resolver,
-                  http_check, timeout, summary, schedule_start),
+                  http_check, timeout, summary, schedule_start,
+                  http_url_map.get(domain)),
             name=f"dns-{domain}",
             daemon=True,
         )
