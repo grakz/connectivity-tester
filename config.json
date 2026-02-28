@@ -2,6 +2,7 @@
   "interval": 5.0,
   "iterations": 10,
   "timeout": 5.0,
+  "thread_stagger_ms": 50,
   "dns_server": "8.8.8.8",
   "http_check": true,
   "domains": [

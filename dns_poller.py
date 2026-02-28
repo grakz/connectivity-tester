@@ -601,30 +601,39 @@ def main() -> None:
                                    on_slot_complete=summary.flush)
 
     # Shared anchor for the tick grid — all threads target t0 + n*interval.
+    # An optional stagger offsets each thread's anchor so they don't all
+    # issue their probes at exactly the same instant (which can inflate RTT
+    # due to GIL contention and kernel ICMP-socket pressure).
     schedule_start = time.monotonic()
+    stagger_s      = config.get("thread_stagger_ms", 50) / 1000.0
 
     threads: list[threading.Thread] = []
+    thread_idx = 0
 
     for domain in domains:
+        t0_thread = schedule_start + thread_idx * stagger_s
         t = threading.Thread(
             target=poll_dns,
             args=(domain, interval, iterations, results_writer, resolver,
-                  http_check, timeout, summary, schedule_start,
+                  http_check, timeout, summary, t0_thread,
                   http_url_map.get(domain)),
             name=f"dns-{domain}",
             daemon=True,
         )
         threads.append(t)
+        thread_idx += 1
 
     for host in ping_hosts:
+        t0_thread = schedule_start + thread_idx * stagger_s
         t = threading.Thread(
             target=poll_ping,
             args=(host, interval, iterations, results_writer, timeout,
-                  summary, schedule_start),
+                  summary, t0_thread),
             name=f"ping-{host}",
             daemon=True,
         )
         threads.append(t)
+        thread_idx += 1
 
     for t in threads:
         t.start()
