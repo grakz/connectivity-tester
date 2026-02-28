@@ -2,8 +2,8 @@
 """Connectivity poller driven by a JSON config file.
 
 Polls one or more DNS domains and/or ICMP ping hosts at a configurable
-interval. All targets are polled concurrently and anchored to a shared
-tick grid so results are aligned in time.
+interval. All probes run sequentially in a single thread per slot, in the
+order: ping hosts → DNS domains → HTTP domains.
 
 CSV output:
   results.csv  — one row per time slot; every target occupies its own
@@ -323,76 +323,111 @@ def http_get(domain: str, timeout: float) -> dict:
     }
 
 
-def poll_dns(domain: str, interval: float, iterations: int,
-             writer: ResultsWriter, resolver: dns.resolver.Resolver,
-             http_check: bool = False, timeout: float = 5.0,
-             summary: SummaryTracker | None = None,
-             schedule_start: float | None = None,
-             http_url: str | None = None) -> None:
-    # domain is always the plain hostname; http_url (if set) is the full URL
-    # to fetch, preserving any path the user specified in the config.
-    http_target = http_url or domain
-    pad = len(str(iterations))
-    t0 = schedule_start if schedule_start is not None else time.monotonic()
+def poll_all(
+    ping_hosts: list[str],
+    domains: list[str],
+    interval: float,
+    iterations: int,
+    writer: ResultsWriter,
+    resolver: "dns.resolver.Resolver | None",
+    http_check: bool,
+    timeout: float,
+    summary: "SummaryTracker | None",
+    http_url_map: dict,
+) -> None:
+    """Single-threaded polling loop.
 
-    next_slot = 0  # index of the next target tick: t0 + next_slot * interval
+    Each slot runs in three sequential phases:
+      1. ICMP ping  — all ping_hosts in order
+      2. DNS lookup — all domains in order
+      3. HTTP GET   — all domains in order (only when http_check is True)
+    """
+    pad = len(str(iterations))
+    t0  = time.monotonic()
+
+    next_slot = 0
     for i in range(1, iterations + 1):
         current_slot = next_slot
         wait = (t0 + current_slot * interval) - time.monotonic()
         if wait > 0:
             time.sleep(wait)
 
-        dns_timestamp = datetime.now().isoformat()
-        dns_result = dns_lookup(domain, resolver)
+        row_data: dict = {}
 
-        if summary:
-            summary.update(domain, "dns", dns_result["success"], dns_result["response_time_ms"])
-
-        row_data = {
-            f"{domain}_dns_timestamp":       dns_timestamp,
-            f"{domain}_dns_success":         dns_result["success"],
-            f"{domain}_dns_response_time_ms": dns_result["response_time_ms"],
-            f"{domain}_dns_resolved_ip":     dns_result["resolved_ip"],
-            f"{domain}_dns_server_ip":       dns_result["dns_server_ip"],
-            f"{domain}_dns_server_name":     dns_result["dns_server_name"],
-            f"{domain}_dns_error":           dns_result["error"],
-        }
-
-        http_result: dict = {}
-        if http_check:
-            http_timestamp = datetime.now().isoformat()
-            http_result = http_get(http_target, timeout)
+        # ── Phase 1: ICMP ping ───────────────────────────────────────────
+        for host in ping_hosts:
+            timestamp = datetime.now().isoformat()
+            result    = ping_host(host, timeout)
             if summary:
-                summary.update(domain, "http", http_result["http_success"],
-                               http_result["http_response_time_ms"])
+                summary.update(host, "ping", result["success"], result["response_time_ms"])
             row_data.update({
-                f"{domain}_http_timestamp":        http_timestamp,
-                f"{domain}_http_success":          http_result["http_success"],
-                f"{domain}_http_status_code":      http_result["http_status_code"],
-                f"{domain}_http_response_time_ms": http_result["http_response_time_ms"],
-                f"{domain}_http_error":            http_result["http_error"],
+                f"{host}_ping_timestamp":        timestamp,
+                f"{host}_ping_success":          result["success"],
+                f"{host}_ping_response_time_ms": result["response_time_ms"],
+                f"{host}_ping_packets_sent":     result["packets_sent"],
+                f"{host}_ping_packets_received": result["packets_received"],
+                f"{host}_ping_error":            result["error"],
             })
+            status = "OK  " if result["success"] else "FAIL"
+            print(
+                f"  [ping {host}  {i:>{pad}}/{iterations}]"
+                f"  {timestamp}  {status}"
+                f"  {result['response_time_ms']:7.1f} ms"
+                f"  {result['error'] if not result['success'] else ''}"
+            )
+
+        # ── Phase 2: DNS lookup ──────────────────────────────────────────
+        for domain in domains:
+            dns_timestamp = datetime.now().isoformat()
+            dns_result    = dns_lookup(domain, resolver)
+            if summary:
+                summary.update(domain, "dns", dns_result["success"], dns_result["response_time_ms"])
+            row_data.update({
+                f"{domain}_dns_timestamp":        dns_timestamp,
+                f"{domain}_dns_success":          dns_result["success"],
+                f"{domain}_dns_response_time_ms": dns_result["response_time_ms"],
+                f"{domain}_dns_resolved_ip":      dns_result["resolved_ip"],
+                f"{domain}_dns_server_ip":        dns_result["dns_server_ip"],
+                f"{domain}_dns_server_name":      dns_result["dns_server_name"],
+                f"{domain}_dns_error":            dns_result["error"],
+            })
+            dns_status = "OK  " if dns_result["success"] else "FAIL"
+            ns = dns_result["dns_server_name"] or dns_result["dns_server_ip"] or "-"
+            print(
+                f"  [dns  {domain}  {i:>{pad}}/{iterations}]"
+                f"  {dns_timestamp}"
+                f"  DNS:{dns_status} {dns_result['response_time_ms']:7.1f} ms"
+                f"  {dns_result['resolved_ip'] or dns_result['error']}"
+                f"  (ns: {ns})"
+            )
+
+        # ── Phase 3: HTTP GET ────────────────────────────────────────────
+        if http_check:
+            for domain in domains:
+                http_target   = http_url_map.get(domain, domain)
+                http_timestamp = datetime.now().isoformat()
+                http_result    = http_get(http_target, timeout)
+                if summary:
+                    summary.update(domain, "http", http_result["http_success"],
+                                   http_result["http_response_time_ms"])
+                row_data.update({
+                    f"{domain}_http_timestamp":        http_timestamp,
+                    f"{domain}_http_success":          http_result["http_success"],
+                    f"{domain}_http_status_code":      http_result["http_status_code"],
+                    f"{domain}_http_response_time_ms": http_result["http_response_time_ms"],
+                    f"{domain}_http_error":            http_result["http_error"],
+                })
+                code  = http_result["http_status_code"]
+                h_ms  = http_result["http_response_time_ms"]
+                h_ok  = "OK  " if http_result["http_success"] else "FAIL"
+                print(
+                    f"  [http {domain}  {i:>{pad}}/{iterations}]"
+                    f"  {http_timestamp}"
+                    f"  HTTP:{h_ok} {h_ms:7.1f} ms"
+                    f"  [{code or http_result['http_error']}]"
+                )
 
         writer.record(current_slot, row_data)
-
-        dns_status = "OK  " if dns_result["success"] else "FAIL"
-        ns = dns_result["dns_server_name"] or dns_result["dns_server_ip"] or "-"
-        line = (
-            f"  [dns  {domain}  {i:>{pad}}/{iterations}]"
-            f"  {dns_timestamp}"
-            f"  DNS:{dns_status} {dns_result['response_time_ms']:7.1f} ms"
-            f"  {dns_result['resolved_ip'] or dns_result['error']}"
-            f"  (ns: {ns})"
-        )
-        if http_check:
-            code = http_result["http_status_code"]
-            h_ms = http_result["http_response_time_ms"]
-            h_ok = "OK  " if http_result["http_success"] else "FAIL"
-            line += (
-                f"  |  HTTP:{h_ok} {h_ms:7.1f} ms"
-                f"  [{code or http_result['http_error']}]"
-            )
-        _print(line)
 
         # Advance to the first slot that is strictly in the future.
         next_slot = math.floor((time.monotonic() - t0) / interval) + 1
@@ -441,47 +476,6 @@ def ping_host(host: str, timeout: float) -> dict:
             "packets_received": 0,
             "error": str(exc),
         }
-
-
-def poll_ping(host: str, interval: float, iterations: int,
-              writer: ResultsWriter, timeout: float,
-              summary: SummaryTracker | None = None,
-              schedule_start: float | None = None) -> None:
-    pad = len(str(iterations))
-    t0 = schedule_start if schedule_start is not None else time.monotonic()
-
-    next_slot = 0  # index of the next target tick: t0 + next_slot * interval
-    for i in range(1, iterations + 1):
-        current_slot = next_slot
-        wait = (t0 + current_slot * interval) - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-
-        timestamp = datetime.now().isoformat()
-        result = ping_host(host, timeout)
-
-        if summary:
-            summary.update(host, "ping", result["success"], result["response_time_ms"])
-
-        writer.record(current_slot, {
-            f"{host}_ping_timestamp":        timestamp,
-            f"{host}_ping_success":          result["success"],
-            f"{host}_ping_response_time_ms": result["response_time_ms"],
-            f"{host}_ping_packets_sent":     result["packets_sent"],
-            f"{host}_ping_packets_received": result["packets_received"],
-            f"{host}_ping_error":            result["error"],
-        })
-
-        status = "OK  " if result["success"] else "FAIL"
-        _print(
-            f"  [ping {host}  {i:>{pad}}/{iterations}]"
-            f"  {timestamp}  {status}"
-            f"  {result['response_time_ms']:7.1f} ms"
-            f"  {result['error'] if not result['success'] else ''}"
-        )
-
-        # Advance to the first slot that is strictly in the future.
-        next_slot = math.floor((time.monotonic() - t0) / interval) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -606,52 +600,22 @@ def main() -> None:
         for col in ["timestamp", "success", "response_time_ms",
                     "packets_sent", "packets_received", "error"]:
             fieldnames.append(f"{host}_ping_{col}")
-    n_writers      = len(domains) + len(ping_hosts)
-    results_writer = ResultsWriter("results.csv", fieldnames, n_writers,
+    results_writer = ResultsWriter("results.csv", fieldnames, n_writers=1,
                                    on_slot_complete=summary.flush)
 
-    # Shared anchor for the tick grid — all threads target t0 + n*interval.
-    # An optional stagger offsets each thread's anchor so they don't all
-    # issue their probes at exactly the same instant (which can inflate RTT
-    # due to GIL contention and kernel ICMP-socket pressure).
-    schedule_start = time.monotonic()
-    stagger_s      = config.get("thread_stagger_ms", 50) / 1000.0
+    poll_all(
+        ping_hosts  = ping_hosts,
+        domains     = domains,
+        interval    = interval,
+        iterations  = iterations,
+        writer      = results_writer,
+        resolver    = resolver,
+        http_check  = http_check,
+        timeout     = timeout,
+        summary     = summary,
+        http_url_map = http_url_map,
+    )
 
-    threads: list[threading.Thread] = []
-    thread_idx = 0
-
-    for domain in domains:
-        t0_thread = schedule_start + thread_idx * stagger_s
-        t = threading.Thread(
-            target=poll_dns,
-            args=(domain, interval, iterations, results_writer, resolver,
-                  http_check, timeout, summary, t0_thread,
-                  http_url_map.get(domain)),
-            name=f"dns-{domain}",
-            daemon=True,
-        )
-        threads.append(t)
-        thread_idx += 1
-
-    for host in ping_hosts:
-        t0_thread = schedule_start + thread_idx * stagger_s
-        t = threading.Thread(
-            target=poll_ping,
-            args=(host, interval, iterations, results_writer, timeout,
-                  summary, t0_thread),
-            name=f"ping-{host}",
-            daemon=True,
-        )
-        threads.append(t)
-        thread_idx += 1
-
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    # Flush any slots that were buffered but never moved past by all threads
-    # (e.g. the very last slot of the run).
     results_writer.finalize()
 
     _print(f"\n  -> results.csv written ({iterations} slots)")
