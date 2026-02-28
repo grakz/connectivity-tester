@@ -369,7 +369,7 @@ def poll_all(
                 f"{host}_ping_error":            result["error"],
             })
             status = "OK  " if result["success"] else "FAIL"
-            print(
+            _print(
                 f"  [ping {host}  {i:>{pad}}/{iterations}]"
                 f"  {timestamp}  {status}"
                 f"  {result['response_time_ms']:7.1f} ms"
@@ -393,7 +393,7 @@ def poll_all(
             })
             dns_status = "OK  " if dns_result["success"] else "FAIL"
             ns = dns_result["dns_server_name"] or dns_result["dns_server_ip"] or "-"
-            print(
+            _print(
                 f"  [dns  {domain}  {i:>{pad}}/{iterations}]"
                 f"  {dns_timestamp}"
                 f"  DNS:{dns_status} {dns_result['response_time_ms']:7.1f} ms"
@@ -420,7 +420,7 @@ def poll_all(
                 code  = http_result["http_status_code"]
                 h_ms  = http_result["http_response_time_ms"]
                 h_ok  = "OK  " if http_result["http_success"] else "FAIL"
-                print(
+                _print(
                     f"  [http {domain}  {i:>{pad}}/{iterations}]"
                     f"  {http_timestamp}"
                     f"  HTTP:{h_ok} {h_ms:7.1f} ms"
